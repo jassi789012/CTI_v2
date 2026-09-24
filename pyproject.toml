@@ -7,7 +7,12 @@ authors = [
     { name = "jassi789012", email = "jassi789012singh@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "bs4>=0.0.2",
+    "playwright>=1.63.0",
+    "psycopg2-binary>=2.9.13",
+    "python-dotenv>=1.2.3",
+]
 
 [project.scripts]
 cti-v2 = "cti_v2:main"

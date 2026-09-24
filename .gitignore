@@ -1,2 +1,16 @@
+# Credentials & secrets
 .env
-.venv
+
+# Virtual environment
+.venv/
+
+# Shodan session cookies (contains auth tokens)
+shodan_cookies.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
