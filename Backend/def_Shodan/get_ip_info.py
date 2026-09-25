@@ -489,27 +489,19 @@ def scrape_host_info(page, ip: str) -> dict:
         }
 
 
-def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
+def get_ip_info_gen(ip, output_file: str = DEFAULT_OUTPUT_FILE):
     """
-    Main entry point to fetch and parse Shodan host details for one or more IPs.
+    Generator that fetches and parses Shodan host details for one or more IPs,
+    yielding structured progress dicts at each step.
 
-    Features:
-      - PostgreSQL storage: data is split across hosts, scans, ports,
-        vulnerabilities, and technologies tables.
-      - Deduplication: if an IP's last_seen date hasn't changed in the DB, it's skipped.
-      - Crash recovery: results are committed after each IP. On restart, IPs already
-        in the database with matching last_seen are skipped (page is still loaded
-        briefly to compare last_seen dates).
-      - Port-specific CVEs via live Playwright dropdown interaction.
-
-    Parameters:
-      ip: A single IP string or a list/iterable of IP strings.
-      output_file: (Legacy) Path to JSON results file. No longer used for primary
-                   storage but kept for API compatibility.
-
-    Returns:
-      If a single IP string: the data dict for that IP (or None if skipped).
-      If a list of IPs: list of data dicts for IPs that were actually scraped.
+    Yields:
+        {"status": "db_init", "success": bool, "error": str|None}
+        {"status": "login", "success": bool}
+        {"status": "ip_start", "ip": str, "current": int, "total": int}
+        {"status": "ip_skip", "ip": str, "current": int, "total": int, "reason": str}
+        {"status": "ip_done", "ip": str, "current": int, "total": int, "ports": int, "cves": int}
+        {"status": "ip_error", "ip": str, "current": int, "total": int, "error": str}
+        {"status": "complete", "total": int, "scraped": int, "skipped": int, "results": list}
     """
     is_single = isinstance(ip, str)
     if is_single:
@@ -519,109 +511,147 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
         ip_list = [str(item).strip() for item in ip if str(item).strip()]
 
     if not ip_list:
-        print("[-] No valid IP addresses provided.")
-        return {} if is_single else []
+        yield {"status": "complete", "total": 0, "scraped": 0, "skipped": 0, "results": []}
+        return
 
     # ── Connect to PostgreSQL ────────────────────────────────────────────
     try:
         db = DBManager()
         db.init_tables()
+        yield {"status": "db_init", "success": True, "error": None}
     except Exception as e:
-        print(f"[-] Database connection failed: {e}")
-        print("[-] Cannot proceed without database.")
-        return {} if is_single else []
-
-    print(f"[*] Starting Shodan host information scraper for {len(ip_list)} IP(s)...")
-    print(f"    Storage: PostgreSQL ({db.conn.info.dbname}@{db.conn.info.host})")
+        yield {"status": "db_init", "success": False, "error": str(e)}
+        return
 
     # Log in to Shodan
     result = shodan_login()
     if not result:
-        print("[-] Login failed. Cannot proceed with host scraping.")
+        yield {"status": "login", "success": False}
         db.close()
-        return {} if is_single else []
+        return
+    yield {"status": "login", "success": True}
 
     pw, browser, context, page = result
     scraped_results = []
     skipped_count = 0
+    total = len(ip_list)
 
     try:
         for idx, target_ip in enumerate(ip_list, start=1):
-            print(f"\n{'='*60}")
-            print(f"[{idx}/{len(ip_list)}] Processing IP: {target_ip}")
-            print(f"{'='*60}")
+            yield {
+                "status": "ip_start",
+                "ip": target_ip,
+                "current": idx,
+                "total": total,
+            }
 
             # ── Crash Recovery Check (from database) ─────────────────────
             stored_last_seen = db.get_latest_last_seen(target_ip, source="shodan")
 
             if stored_last_seen is not None:
                 # IP exists in database — load page briefly to compare last_seen
-                print(f"[*] IP found in database (last_seen={stored_last_seen}). Checking for updates...")
                 try:
                     page.goto(f"https://www.shodan.io/host/{target_ip}",
                               wait_until="domcontentloaded", timeout=120000)
                     page.wait_for_timeout(2000)
 
-                    # Handle login redirect
                     if "account.shodan.io/login" in page.url:
-                        print("[-] Session expired during check. Stopping.")
+                        yield {
+                            "status": "ip_error",
+                            "ip": target_ip,
+                            "current": idx,
+                            "total": total,
+                            "error": "Session expired",
+                        }
                         break
 
                     live_last_seen = quick_extract_last_seen(page)
-                    print(f"    Shodan last_seen: {live_last_seen}")
 
                     if live_last_seen and live_last_seen == stored_last_seen:
-                        print(f"[=] Skipping {target_ip} -- data unchanged (last_seen={stored_last_seen}).")
                         skipped_count += 1
-                        if idx < len(ip_list):
+                        yield {
+                            "status": "ip_skip",
+                            "ip": target_ip,
+                            "current": idx,
+                            "total": total,
+                            "reason": f"unchanged (last_seen={stored_last_seen})",
+                        }
+                        if idx < total:
                             time.sleep(HOST_DELAY_SECONDS)
                         continue
                     else:
-                        print(f"[!] Data has changed (db={stored_last_seen}, shodan={live_last_seen}). Re-scraping...")
-                        # Page is already loaded, parse it directly
+                        # Data changed — re-scrape from already loaded page
                         html_content = page.content()
                         parsed_data = parse_shodan_host_html(html_content, ip=target_ip)
 
-                        # Extract port-specific CVEs
                         port_cve_map = extract_port_cves(page, parsed_data.get("open_ports", []))
                         for banner in parsed_data.get("port_banners", []):
                             if banner["port"] in port_cve_map:
                                 banner["cve_details"] = port_cve_map[banner["port"]]
 
-                        total_cves = sum(len(b.get("cve_details", [])) for b in parsed_data.get("port_banners", []))
-                        print(f"[+] Re-scraped {target_ip}: {len(parsed_data.get('open_ports',[]))} ports, {total_cves} CVEs")
-
                         db.save_shodan_scan(parsed_data)
                         scraped_results.append(parsed_data)
 
+                        total_cves = sum(len(b.get("cve_details", [])) for b in parsed_data.get("port_banners", []))
+                        yield {
+                            "status": "ip_done",
+                            "ip": target_ip,
+                            "current": idx,
+                            "total": total,
+                            "ports": len(parsed_data.get("open_ports", [])),
+                            "cves": total_cves,
+                        }
+
                 except Exception as e:
-                    print(f"[-] Error during update check for {target_ip}: {e}")
-                    print("    Will attempt full scrape...")
+                    # Update check failed — try full scrape
                     host_info = scrape_host_info(page, target_ip)
                     if "error" not in host_info:
                         db.save_shodan_scan(host_info)
                         scraped_results.append(host_info)
+                        total_cves = sum(len(b.get("cve_details", [])) for b in host_info.get("port_banners", []))
+                        yield {
+                            "status": "ip_done",
+                            "ip": target_ip,
+                            "current": idx,
+                            "total": total,
+                            "ports": len(host_info.get("open_ports", [])),
+                            "cves": total_cves,
+                        }
+                    else:
+                        yield {
+                            "status": "ip_error",
+                            "ip": target_ip,
+                            "current": idx,
+                            "total": total,
+                            "error": str(e),
+                        }
             else:
                 # ── New IP — full scrape ─────────────────────────────────
                 host_info = scrape_host_info(page, target_ip)
                 if "error" not in host_info:
                     db.save_shodan_scan(host_info)
                     scraped_results.append(host_info)
+                    total_cves = sum(len(b.get("cve_details", [])) for b in host_info.get("port_banners", []))
+                    yield {
+                        "status": "ip_done",
+                        "ip": target_ip,
+                        "current": idx,
+                        "total": total,
+                        "ports": len(host_info.get("open_ports", [])),
+                        "cves": total_cves,
+                    }
                 else:
-                    print(f"[-] Could not scrape {target_ip}: {host_info.get('error')}")
+                    yield {
+                        "status": "ip_error",
+                        "ip": target_ip,
+                        "current": idx,
+                        "total": total,
+                        "error": host_info.get("error", "Unknown error"),
+                    }
 
             # Polite delay between IPs
-            if idx < len(ip_list):
+            if idx < total:
                 time.sleep(HOST_DELAY_SECONDS)
-
-        # ── Summary ──────────────────────────────────────────────────────
-        print(f"\n{'='*60}")
-        print(f"[DONE] Scraping complete.")
-        print(f"    Total IPs processed: {len(ip_list)}")
-        print(f"    Scraped (new/updated): {len(scraped_results)}")
-        print(f"    Skipped (unchanged):   {skipped_count}")
-        print(f"    Storage: PostgreSQL ({db.conn.info.dbname})")
-        print(f"{'='*60}")
 
     finally:
         save_cookies(context)
@@ -629,9 +659,54 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
         pw.stop()
         db.close()
 
+    yield {
+        "status": "complete",
+        "total": total,
+        "scraped": len(scraped_results),
+        "skipped": skipped_count,
+        "results": scraped_results,
+    }
+
+
+# ─── Convenience wrapper (backward compatible) ──────────────────────────────
+def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
+    """
+    Non-generator wrapper: fetches host info and returns the results list.
+    Consumes get_ip_info_gen() internally, printing progress.
+    """
+    is_single = isinstance(ip, str)
+    results = []
+
+    for update in get_ip_info_gen(ip, output_file):
+        status = update["status"]
+        if status == "db_init":
+            if not update["success"]:
+                print(f"[-] Database connection failed: {update['error']}")
+                return {} if is_single else []
+        elif status == "login":
+            if not update["success"]:
+                print("[-] Login failed. Cannot proceed.")
+                return {} if is_single else []
+        elif status == "ip_start":
+            print(f"\n{'='*60}")
+            print(f"[{update['current']}/{update['total']}] Processing IP: {update['ip']}")
+            print(f"{'='*60}")
+        elif status == "ip_skip":
+            print(f"[=] Skipping {update['ip']} -- {update['reason']}")
+        elif status == "ip_done":
+            print(f"[+] {update['ip']}: {update['ports']} ports, {update['cves']} CVEs")
+        elif status == "ip_error":
+            print(f"[-] {update['ip']}: {update['error']}")
+        elif status == "complete":
+            results = update["results"]
+            print(f"\n{'='*60}")
+            print(f"[DONE] Total: {update['total']}, "
+                  f"Scraped: {update['scraped']}, Skipped: {update['skipped']}")
+            print(f"{'='*60}")
+
     if is_single:
-        return scraped_results[0] if scraped_results else None
-    return scraped_results
+        return results[0] if results else None
+    return results
 
 
 # ═════════════════════════════════════════════════════════════════════════════

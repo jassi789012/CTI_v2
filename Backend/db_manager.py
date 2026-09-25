@@ -419,6 +419,94 @@ class DBManager:
             return False
 
     # ═════════════════════════════════════════════════════════════════════════
+    # High-Level: Save a Complete Nmap Scan
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def save_nmap_scan(self, parsed_data: dict) -> bool:
+        """
+        Save a complete Nmap scan result into the database.
+
+        This mirrors save_shodan_scan() but for Nmap data. It:
+          1. Upserts the host record (shares the hosts table with Shodan)
+          2. Inserts a scan with source='nmap'
+          3. Inserts ports, vulnerabilities
+          4. Commits the transaction
+
+        Returns True if data was saved, False if skipped/failed.
+        """
+        ip = parsed_data.get("ip")
+        if not ip:
+            print("[-] Cannot save nmap scan: no IP in parsed data.")
+            return False
+
+        if "error" in parsed_data:
+            print(f"[-] Skipping {ip}: error result.")
+            return False
+
+        try:
+            # 1. Upsert host
+            general_info = parsed_data.get("general_info", {})
+            host_id = self.upsert_host(ip, general_info)
+
+            # 2. Build metadata (nmap-specific extras)
+            metadata = {}
+            if parsed_data.get("os_detection"):
+                metadata["os_detection"] = parsed_data["os_detection"]
+            if parsed_data.get("uptime"):
+                metadata["uptime"] = parsed_data["uptime"]
+            if parsed_data.get("tcp_sequence"):
+                metadata["tcp_sequence"] = parsed_data["tcp_sequence"]
+            if parsed_data.get("traceroute"):
+                metadata["traceroute"] = parsed_data["traceroute"]
+            if parsed_data.get("scan_info"):
+                metadata["scan_info"] = parsed_data["scan_info"]
+
+            hostnames = general_info.get("hostnames", [])
+            if hostnames:
+                metadata["hostnames"] = hostnames
+
+            mac = general_info.get("mac_address")
+            if mac:
+                metadata["mac_address"] = mac
+                metadata["mac_vendor"] = general_info.get("mac_vendor")
+
+            # 3. Insert scan — use current time as source_last_seen since Nmap is live
+            scraped_at = parsed_data.get("scraped_at", datetime.now(timezone.utc).isoformat())
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            scan_id = self.insert_scan(
+                host_id=host_id,
+                source="nmap",
+                source_last_seen=today_str,
+                scraped_at=scraped_at,
+                raw_data=parsed_data,
+                metadata=metadata,
+            )
+
+            # 4. Insert ports + vulnerabilities
+            total_cves = 0
+            for banner in parsed_data.get("port_banners", []):
+                port_id = self.insert_port(scan_id, banner)
+                cve_list = banner.get("cve_details", [])
+                if cve_list:
+                    self.insert_vulnerabilities(port_id, cve_list)
+                    total_cves += len(cve_list)
+
+            # 5. Commit the whole transaction
+            self.conn.commit()
+
+            port_count = len(parsed_data.get("port_banners", []))
+            os_name = general_info.get("OS", "Unknown")
+            print(f"[+] IP {ip}: Nmap scan saved (scan_id={scan_id}, "
+                  f"{port_count} ports, {total_cves} CVEs, OS: {os_name}).")
+            return True
+
+        except Exception as e:
+            self.conn.rollback()
+            print(f"[-] Error saving nmap scan for {ip}: {e}")
+            return False
+
+    # ═════════════════════════════════════════════════════════════════════════
     # Query Helpers (for agent and scripts)
     # ═════════════════════════════════════════════════════════════════════════
 
