@@ -283,124 +283,44 @@ def scrape_query(page, query):
     return all_ips
 
 
-# ─── Generator: yields structured progress dicts ────────────────────────────
-def get_ip_query_ip_gen(queries):
+# ─── Main query function ────────────────────────────────────────────────────
+def get_ip_query_ip(queries):
     """
-    Generator that authenticates with Shodan and scrapes IPs for a list of
-    search queries, yielding structured progress dicts at each step.
+    Authenticate with Shodan and scrape IPs for a list of search queries.
 
-    Yields:
-        {"status": "login", "success": bool}
-        {"status": "query_start", "query": int, "total_queries": int, "query_text": str}
-        {"status": "page_done", "query": int, "total_queries": int, "page": int, "total_pages": int, "ips_found": int, "total_ips": int}
-        {"status": "query_done", "query": int, "total_queries": int, "query_text": str, "query_ips": int, "total_ips": int}
-        {"status": "complete", "total_ips": int, "ips": list[str]}
+    Args:
+        queries: A list of Shodan search query strings.
+                 Example: ["port:80", "apache country:US", "nginx city:Delhi"]
+
+    Returns:
+        A list of unique IP addresses (IPv4 + IPv6) found across all queries.
     """
     result = shodan_login()
     if result is None:
-        yield {"status": "login", "success": False}
-        return
-    yield {"status": "login", "success": True}
+        return []
 
     pw, browser, context, page = result
     all_ips = set()
-    total_queries = len(queries)
 
     try:
         for idx, query in enumerate(queries, start=1):
-            yield {
-                "status": "query_start",
-                "query": idx,
-                "total_queries": total_queries,
-                "query_text": query,
-            }
+            print(f"\n[*] Query {idx}/{len(queries)}: \"{query}\"")
+            query_ips = scrape_query(page, query)
+            all_ips.update(query_ips)
+            print(f"[+] Total unique IPs so far: {len(all_ips)}")
 
-            # ── Inline scrape_query logic so we can yield per-page progress ──
-            encoded_query = quote(query)
-            query_ips = set()
-
-            for page_num in range(1, MAX_PAGES_PER_QUERY + 1):
-                if page_num == 1:
-                    url = f"https://www.shodan.io/search?query={encoded_query}"
-                else:
-                    url = f"https://www.shodan.io/search?query={encoded_query}&page={page_num}"
-
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                    page.wait_for_timeout(1500)
-                except Exception:
-                    break
-
-                if page.locator("text=No results found").count() > 0:
-                    break
-
-                ips_on_page = extract_ips_from_page(page)
-                query_ips.update(ips_on_page)
-                all_ips.update(ips_on_page)
-
-                yield {
-                    "status": "page_done",
-                    "query": idx,
-                    "total_queries": total_queries,
-                    "page": page_num,
-                    "total_pages": MAX_PAGES_PER_QUERY,
-                    "ips_found": len(ips_on_page),
-                    "total_ips": len(all_ips),
-                }
-
-                if page_num < MAX_PAGES_PER_QUERY:
-                    time.sleep(PAGE_DELAY_SECONDS)
-
-            yield {
-                "status": "query_done",
-                "query": idx,
-                "total_queries": total_queries,
-                "query_text": query,
-                "query_ips": len(query_ips),
-                "total_ips": len(all_ips),
-            }
-
-            if idx < total_queries:
+            # Delay between queries
+            if idx < len(queries):
                 time.sleep(PAGE_DELAY_SECONDS)
 
+        print(f"\n[+] Scraping complete. Total unique IPs collected: {len(all_ips)}")
     finally:
-        save_cookies(context)
+        save_cookies(context)  # Refresh cookies before closing
         browser.close()
         pw.stop()
 
-    yield {
-        "status": "complete",
-        "total_ips": len(all_ips),
-        "ips": list(all_ips),
-    }
+    return list(all_ips)
 
-
-# ─── Convenience wrapper (backward compatible) ──────────────────────────────
-def get_ip_query_ip(queries):
-    """
-    Non-generator wrapper: scrapes IPs and returns the final list.
-    Consumes get_ip_query_ip_gen() internally, printing progress.
-    """
-    ips = []
-    for update in get_ip_query_ip_gen(queries):
-        status = update["status"]
-        if status == "login":
-            if not update["success"]:
-                print("[-] Login failed.")
-                return []
-        elif status == "query_start":
-            print(f"\n[*] Query {update['query']}/{update['total_queries']}: \"{update['query_text']}\"")
-        elif status == "page_done":
-            print(f"  [*] Page {update['page']}/{update['total_pages']}: "
-                  f"{update['ips_found']} IPs (total: {update['total_ips']})")
-        elif status == "query_done":
-            print(f"[+] Query done — {update['query_ips']} IPs this query, "
-                  f"{update['total_ips']} total unique")
-        elif status == "complete":
-            ips = update["ips"]
-            print(f"\n[+] Scraping complete. Total unique IPs: {update['total_ips']}")
-    return ips
-                                                        
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":

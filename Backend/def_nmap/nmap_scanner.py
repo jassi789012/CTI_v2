@@ -261,49 +261,43 @@ def _extract_cves(script_id: str, output: str) -> list:
 # Main: Scan IPs and Save to Database
 # ═════════════════════════════════════════════════════════════════════════════
 
-def nmap_scan_ips_gen(
+def nmap_scan_ips(
     ips: list,
     scan_args: str = None,
     skip_db: bool = False,
     workers: int = 5,
-):
+) -> list:
     """
-    Generator that scans a list of IPs with Nmap and yields structured
-    progress dicts for each worker/IP at each step.
+    Scan a list of IPs with Nmap and store results in PostgreSQL.
 
-    Uses a thread-safe queue so worker threads can post progress that
-    the generator yields from the main thread.
+    Args:
+        ips:         List of IP addresses to scan
+        scan_args:   Custom Nmap arguments (default: comprehensive scan)
+        skip_db:     If True, return parsed data without saving to DB
+        workers:     Number of parallel Nmap processes (default: 5)
 
-    Yields:
-        {"status": "init", "total": int, "workers": int}
-        {"status": "nmap_check", "success": bool, "error": str|None}
-        {"status": "db_init", "success": bool, "error": str|None}
-        {"status": "ip_start", "ip": str, "current": int, "total": int, "worker": int}
-        {"status": "ip_done", "ip": str, "current": int, "total": int, "worker": int, "ports": int, "cves": int, "os": str}
-        {"status": "ip_error", "ip": str, "current": int, "total": int, "worker": int, "error": str}
-        {"status": "complete", "total": int, "succeeded": int, "failed": int, "total_ports": int, "total_cves": int, "results": list}
+    Returns:
+        List of parsed host dictionaries
     """
-    import queue
-
     if not ips:
-        yield {"status": "complete", "total": 0, "succeeded": 0, "failed": 0,
-               "total_ports": 0, "total_cves": 0, "results": []}
-        return
+        print("[-] No IPs provided.")
+        return []
 
     args = scan_args or DEFAULT_SCAN_ARGS
     unique_ips = list(dict.fromkeys(ips))
-    total = len(unique_ips)
-    num_workers = min(workers, total)
+    num_workers = min(workers, len(unique_ips))
 
-    yield {"status": "init", "total": total, "workers": num_workers}
+    print(f"\n{'='*70}")
+    print(f"  Nmap Scanner — {len(unique_ips)} target(s), {num_workers} workers")
+    print(f"{'='*70}")
 
     # Verify nmap is installed
     try:
         nmap.PortScanner()
-        yield {"status": "nmap_check", "success": True, "error": None}
     except nmap.PortScannerError as e:
-        yield {"status": "nmap_check", "success": False, "error": str(e)}
-        return
+        print(f"[-] Nmap not found: {e}")
+        print("    Install from: https://nmap.org/download.html")
+        return []
 
     # Connect to database
     db = None
@@ -312,128 +306,68 @@ def nmap_scan_ips_gen(
         try:
             db = DBManager()
             db.init_tables()
-            yield {"status": "db_init", "success": True, "error": None}
         except Exception as e:
-            yield {"status": "db_init", "success": False, "error": str(e)}
-            # Continue without DB — results still returned
-
-    # ─── Thread-safe progress queue ──────────────────────────────────────
-    progress_queue = queue.Queue()
-
-    # Map thread IDs to worker numbers
-    thread_worker_map = {}
-    worker_counter = [0]
-    map_lock = threading.Lock()
-
-    def get_worker_id():
-        tid = threading.current_thread().ident
-        with map_lock:
-            if tid not in thread_worker_map:
-                worker_counter[0] += 1
-                thread_worker_map[tid] = worker_counter[0]
-            return thread_worker_map[tid]
+            print(f"[-] Could not connect to database: {e}")
+            print("    Results will NOT be saved to PostgreSQL.")
 
     # ─── Worker function (runs per IP in its own thread) ─────────────────
     def scan_single_ip(ip_index_tuple):
         i, ip = ip_index_tuple
-        worker_id = get_worker_id()
+        # Each thread gets its own scanner instance
         nm = nmap.PortScanner()
 
-        progress_queue.put({
-            "status": "ip_start",
-            "ip": ip,
-            "current": i,
-            "total": total,
-            "worker": worker_id,
-        })
+        print(f"\n[{i}/{len(unique_ips)}] Scanning: {ip}")
 
         try:
             nm.scan(hosts=ip, arguments=args)
         except nmap.PortScannerError as e:
-            progress_queue.put({
-                "status": "ip_error",
-                "ip": ip, "current": i, "total": total,
-                "worker": worker_id, "error": str(e),
-            })
+            print(f"[-] Nmap error for {ip}: {e}")
             return {"ip": ip, "error": str(e)}
         except Exception as e:
-            progress_queue.put({
-                "status": "ip_error",
-                "ip": ip, "current": i, "total": total,
-                "worker": worker_id, "error": str(e),
-            })
+            print(f"[-] Unexpected error scanning {ip}: {e}")
             return {"ip": ip, "error": str(e)}
 
         scanned_hosts = nm.all_hosts()
         if not scanned_hosts:
-            progress_queue.put({
-                "status": "ip_error",
-                "ip": ip, "current": i, "total": total,
-                "worker": worker_id, "error": "Host down or no response",
-            })
+            print(f"[-] No results for {ip} (host might be down).")
             return {"ip": ip, "error": "Host down or no response"}
 
+        # Parse first host result
         host = scanned_hosts[0]
         try:
             parsed = parse_scan_result(nm, host)
-            port_count = len(parsed.get("open_ports", []))
-            cve_count = sum(len(p.get("cve_details", [])) for p in parsed.get("port_banners", []))
-            os_guess = parsed.get("general_info", {}).get("OS") or "Unknown"
 
+            port_count = len(parsed.get("open_ports", []))
+            cve_count = sum(
+                len(p.get("cve_details", []))
+                for p in parsed.get("port_banners", [])
+            )
+            os_guess = parsed.get("general_info", {}).get("OS") or "Unknown"
+            print(f"    [+] {host}: {port_count} open ports, "
+                  f"{cve_count} CVEs, OS: {os_guess}")
+
+            # Save to database (thread-safe with lock)
             if db:
                 with db_lock:
                     try:
                         db.save_nmap_scan(parsed)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"    [-] DB save error: {e}")
 
-            progress_queue.put({
-                "status": "ip_done",
-                "ip": host, "current": i, "total": total,
-                "worker": worker_id,
-                "ports": port_count, "cves": cve_count, "os": os_guess,
-            })
             return parsed
 
         except Exception as e:
-            progress_queue.put({
-                "status": "ip_error",
-                "ip": host, "current": i, "total": total,
-                "worker": worker_id, "error": str(e),
-            })
+            print(f"    [-] Parse error for {host}: {e}")
             return {"ip": host, "error": str(e)}
 
-    # ─── Run workers and yield progress ──────────────────────────────────
+    # ─── Run workers ─────────────────────────────────────────────────────
     indexed_ips = list(enumerate(unique_ips, 1))
-    all_results = []
 
-    # Submit all tasks, drain the queue while waiting
-    pool = ThreadPoolExecutor(max_workers=num_workers)
-    futures = [pool.submit(scan_single_ip, item) for item in indexed_ips]
-
-    # Yield progress as workers report in
-    completed = 0
-    while completed < len(futures):
-        try:
-            msg = progress_queue.get(timeout=0.5)
-            yield msg
-        except queue.Empty:
-            pass
-
-        # Check how many futures are done
-        newly_done = sum(1 for f in futures if f.done()) - completed
-        if newly_done > 0:
-            completed += newly_done
-
-    # Drain any remaining messages
-    while not progress_queue.empty():
-        yield progress_queue.get_nowait()
-
-    # Collect results
-    all_results = [f.result() for f in futures]
-    pool.shutdown(wait=False)
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        all_results = list(pool.map(scan_single_ip, indexed_ips))
 
     # ─── Summary ─────────────────────────────────────────────────────────
+    print(f"\n{'='*70}")
     success = [r for r in all_results if "error" not in r]
     failed = [r for r in all_results if "error" in r]
     total_ports = sum(len(r.get("open_ports", [])) for r in success)
@@ -441,62 +375,14 @@ def nmap_scan_ips_gen(
         sum(len(p.get("cve_details", [])) for p in r.get("port_banners", []))
         for r in success
     )
+    print(f"  Scan Complete: {len(success)} succeeded, {len(failed)} failed")
+    print(f"  Total: {total_ports} open ports, {total_cves} CVEs detected")
+    print(f"{'='*70}\n")
 
     if db:
         db.close()
 
-    yield {
-        "status": "complete",
-        "total": total,
-        "succeeded": len(success),
-        "failed": len(failed),
-        "total_ports": total_ports,
-        "total_cves": total_cves,
-        "results": all_results,
-    }
-
-
-# ─── Convenience wrapper (backward compatible) ──────────────────────────────
-def nmap_scan_ips(
-    ips: list,
-    scan_args: str = None,
-    skip_db: bool = False,
-    workers: int = 5,
-) -> list:
-    """
-    Non-generator wrapper: scans IPs and returns the results list.
-    Consumes nmap_scan_ips_gen() internally, printing progress.
-    """
-    results = []
-    for update in nmap_scan_ips_gen(ips, scan_args, skip_db, workers):
-        status = update["status"]
-        if status == "init":
-            print(f"\n{'='*70}")
-            print(f"  Nmap Scanner — {update['total']} target(s), {update['workers']} workers")
-            print(f"{'='*70}")
-        elif status == "nmap_check":
-            if not update["success"]:
-                print(f"[-] Nmap not found: {update['error']}")
-                print("    Install from: https://nmap.org/download.html")
-                return []
-        elif status == "db_init":
-            if not update["success"]:
-                print(f"[-] Could not connect to database: {update['error']}")
-        elif status == "ip_start":
-            print(f"\n[Worker {update['worker']}] [{update['current']}/{update['total']}] "
-                  f"Scanning: {update['ip']}")
-        elif status == "ip_done":
-            print(f"  [Worker {update['worker']}] {update['ip']}: "
-                  f"{update['ports']} open ports, {update['cves']} CVEs, OS: {update['os']}")
-        elif status == "ip_error":
-            print(f"  [Worker {update['worker']}] {update['ip']}: ERROR — {update['error']}")
-        elif status == "complete":
-            results = update["results"]
-            print(f"\n{'='*70}")
-            print(f"  Scan Complete: {update['succeeded']} succeeded, {update['failed']} failed")
-            print(f"  Total: {update['total_ports']} open ports, {update['total_cves']} CVEs detected")
-            print(f"{'='*70}\n")
-    return results
+    return all_results
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -519,5 +405,4 @@ if __name__ == "__main__":
             ports = r.get("open_ports", [])
             os_name = r.get("general_info", {}).get("OS") or "Unknown"
             print(f"  {r['ip']}: {len(ports)} ports, OS: {os_name}")
-
 
