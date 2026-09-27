@@ -386,8 +386,80 @@ def nmap_scan_ips(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Single-IP function (for Engine / LangGraph use)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_single_ip(ip: str, scan_args: str = None, db=None) -> dict:
+    """
+    Scan a single IP with Nmap and optionally save to database.
+
+    This is designed for the LangGraph engine which loops over IPs one
+    at a time. Unlike nmap_scan_ips(), this does NOT manage DB lifecycle.
+
+    Args:
+        ip:         Single IP address to scan.
+        scan_args:  Custom Nmap arguments (default: DEFAULT_SCAN_ARGS).
+        db:         An already-connected DBManager instance (optional).
+                    If provided, results are saved to DB.
+
+    Returns:
+        dict with keys:
+            - "status": "scanned" | "error"
+            - "ip": the target IP
+            - "data": parsed scan result dict (if scanned)
+            - "reason": error message (if error)
+    """
+    ip = ip.strip()
+    if not ip:
+        return {"status": "error", "ip": ip, "reason": "Empty IP"}
+
+    args = scan_args or DEFAULT_SCAN_ARGS
+
+    # Each call gets its own scanner instance
+    try:
+        nm = nmap.PortScanner()
+    except nmap.PortScannerError as e:
+        return {"status": "error", "ip": ip, "reason": f"Nmap not found: {e}"}
+
+    print(f"[*] Nmap scanning: {ip}")
+
+    try:
+        nm.scan(hosts=ip, arguments=args)
+    except nmap.PortScannerError as e:
+        return {"status": "error", "ip": ip, "reason": f"Nmap error: {e}"}
+    except Exception as e:
+        return {"status": "error", "ip": ip, "reason": f"Unexpected error: {e}"}
+
+    scanned_hosts = nm.all_hosts()
+    if not scanned_hosts:
+        return {"status": "error", "ip": ip, "reason": "Host down or no response"}
+
+    host = scanned_hosts[0]
+    try:
+        parsed = parse_scan_result(nm, host)
+
+        port_count = len(parsed.get("open_ports", []))
+        cve_count = sum(len(p.get("cve_details", [])) for p in parsed.get("port_banners", []))
+        os_guess = parsed.get("general_info", {}).get("OS") or "Unknown"
+        print(f"[+] Nmap {host}: {port_count} open ports, {cve_count} CVEs, OS: {os_guess}")
+
+        # Save to database if connection provided
+        if db:
+            try:
+                db.save_nmap_scan(parsed)
+            except Exception as e:
+                print(f"[-] DB save error for {ip}: {e}")
+
+        return {"status": "scanned", "ip": ip, "data": parsed}
+
+    except Exception as e:
+        return {"status": "error", "ip": ip, "reason": f"Parse error: {e}"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # CLI Entry Point
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

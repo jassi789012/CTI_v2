@@ -125,6 +125,80 @@ CREATE TABLE IF NOT EXISTS technologies (
 
 CREATE INDEX IF NOT EXISTS idx_tech_scan_id ON technologies (scan_id);
 CREATE INDEX IF NOT EXISTS idx_tech_name    ON technologies (name);
+
+-- 6. CVE Details — enriched CVE data from NVD
+CREATE TABLE IF NOT EXISTS cve_details (
+    id                     SERIAL PRIMARY KEY,
+    cve_id                 TEXT NOT NULL UNIQUE,
+    description            TEXT,
+    cwe_id                 TEXT,
+    cwe_name               TEXT,
+    cvss_version           TEXT,
+    cvss_vector            TEXT,
+    attack_vector          TEXT,
+    attack_complexity      TEXT,
+    privileges_required    TEXT,
+    user_interaction       TEXT,
+    scope                  TEXT,
+    confidentiality_impact TEXT,
+    integrity_impact       TEXT,
+    availability_impact    TEXT,
+    base_score             FLOAT,
+    severity               TEXT,
+    published_date         TEXT,
+    last_modified_date     TEXT,
+    reference_urls         JSONB DEFAULT '[]'::jsonb,
+    nvd_raw                JSONB,
+    fetched_at             TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_cve_details_cve_id   ON cve_details (cve_id);
+CREATE INDEX IF NOT EXISTS idx_cve_details_severity ON cve_details (severity);
+CREATE INDEX IF NOT EXISTS idx_cve_details_score    ON cve_details (base_score DESC);
+
+-- 7. CVE Affected Products — CPE data from NVD
+CREATE TABLE IF NOT EXISTS cve_affected_products (
+    id              SERIAL PRIMARY KEY,
+    cve_detail_id   INT NOT NULL REFERENCES cve_details(id) ON DELETE CASCADE,
+    vendor          TEXT,
+    product         TEXT,
+    version         TEXT,
+    affected_platform TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cve_ap_detail_id ON cve_affected_products (cve_detail_id);
+CREATE INDEX IF NOT EXISTS idx_cve_ap_vendor    ON cve_affected_products (vendor);
+CREATE INDEX IF NOT EXISTS idx_cve_ap_product   ON cve_affected_products (product);
+
+-- 8. CVE Analysis — ChatGPT enrichment
+CREATE TABLE IF NOT EXISTS cve_analysis (
+    id                        SERIAL PRIMARY KEY,
+    cve_detail_id             INT NOT NULL UNIQUE REFERENCES cve_details(id) ON DELETE CASCADE,
+    title                     TEXT,
+    exploitation_info         JSONB,
+    mitigations               JSONB,
+    detection_recommendations JSONB,
+    vulnerability_walkthrough JSONB,
+    chatgpt_references        JSONB,
+    chatgpt_raw               JSONB,
+    analyzed_at               TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_cve_analysis_detail_id ON cve_analysis (cve_detail_id);
+
+-- 9. CVE MITRE ATT&CK Mappings — from ChatGPT
+CREATE TABLE IF NOT EXISTS cve_mitre_mappings (
+    id               SERIAL PRIMARY KEY,
+    cve_analysis_id  INT NOT NULL REFERENCES cve_analysis(id) ON DELETE CASCADE,
+    tactic_id        TEXT,
+    tactic_name      TEXT,
+    technique_id     TEXT,
+    technique_name   TEXT,
+    justification    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cve_mitre_analysis_id  ON cve_mitre_mappings (cve_analysis_id);
+CREATE INDEX IF NOT EXISTS idx_cve_mitre_technique_id ON cve_mitre_mappings (technique_id);
 """
 
 
@@ -545,6 +619,252 @@ class DBManager:
                 ORDER BY s.scraped_at DESC
             """, (ip,))
             return [dict(row) for row in cur.fetchall()]
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # CVE Operations (for cve_mapper)
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def check_cve_exists(self, cve_id: str) -> bool:
+        """Check if a CVE already has NVD data stored."""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT id FROM cve_details WHERE cve_id = %s", (cve_id,))
+            return cur.fetchone() is not None
+
+    def check_cve_analysis_exists(self, cve_id: str) -> bool:
+        """Check if a CVE already has ChatGPT analysis stored."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT ca.id FROM cve_analysis ca
+                JOIN cve_details cd ON cd.id = ca.cve_detail_id
+                WHERE cd.cve_id = %s
+            """, (cve_id,))
+            return cur.fetchone() is not None
+
+    def save_cve_nvd_data(self, cve_id: str, nvd_parsed: dict) -> int:
+        """
+        Upsert NVD data for a CVE. Returns the cve_detail_id.
+
+        nvd_parsed should contain:
+            description, cwe_id, cwe_name, cvss_version, cvss_vector,
+            attack_vector, attack_complexity, privileges_required,
+            user_interaction, scope, confidentiality_impact,
+            integrity_impact, availability_impact, base_score, severity,
+            published_date, last_modified_date, reference_urls,
+            affected_products: [{vendor, product, version, affected_platform}],
+            nvd_raw: full NVD API response
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO cve_details (
+                        cve_id, description, cwe_id, cwe_name,
+                        cvss_version, cvss_vector, attack_vector,
+                        attack_complexity, privileges_required,
+                        user_interaction, scope, confidentiality_impact,
+                        integrity_impact, availability_impact,
+                        base_score, severity, published_date,
+                        last_modified_date, reference_urls, nvd_raw
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (cve_id) DO UPDATE SET
+                        description            = EXCLUDED.description,
+                        cwe_id                 = EXCLUDED.cwe_id,
+                        cwe_name               = EXCLUDED.cwe_name,
+                        cvss_version           = EXCLUDED.cvss_version,
+                        cvss_vector            = EXCLUDED.cvss_vector,
+                        attack_vector          = EXCLUDED.attack_vector,
+                        attack_complexity      = EXCLUDED.attack_complexity,
+                        privileges_required    = EXCLUDED.privileges_required,
+                        user_interaction       = EXCLUDED.user_interaction,
+                        scope                  = EXCLUDED.scope,
+                        confidentiality_impact = EXCLUDED.confidentiality_impact,
+                        integrity_impact       = EXCLUDED.integrity_impact,
+                        availability_impact    = EXCLUDED.availability_impact,
+                        base_score             = EXCLUDED.base_score,
+                        severity               = EXCLUDED.severity,
+                        published_date         = EXCLUDED.published_date,
+                        last_modified_date     = EXCLUDED.last_modified_date,
+                        reference_urls         = EXCLUDED.reference_urls,
+                        nvd_raw                = EXCLUDED.nvd_raw,
+                        fetched_at             = NOW()
+                    RETURNING id
+                """, (
+                    cve_id,
+                    nvd_parsed.get("description"),
+                    nvd_parsed.get("cwe_id"),
+                    nvd_parsed.get("cwe_name"),
+                    nvd_parsed.get("cvss_version"),
+                    nvd_parsed.get("cvss_vector"),
+                    nvd_parsed.get("attack_vector"),
+                    nvd_parsed.get("attack_complexity"),
+                    nvd_parsed.get("privileges_required"),
+                    nvd_parsed.get("user_interaction"),
+                    nvd_parsed.get("scope"),
+                    nvd_parsed.get("confidentiality_impact"),
+                    nvd_parsed.get("integrity_impact"),
+                    nvd_parsed.get("availability_impact"),
+                    nvd_parsed.get("base_score"),
+                    nvd_parsed.get("severity"),
+                    nvd_parsed.get("published_date"),
+                    nvd_parsed.get("last_modified_date"),
+                    Json(nvd_parsed.get("reference_urls", [])),
+                    Json(nvd_parsed.get("nvd_raw", {})),
+                ))
+                cve_detail_id = cur.fetchone()[0]
+
+            # Insert affected products (delete old ones first for upsert)
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM cve_affected_products WHERE cve_detail_id = %s",
+                    (cve_detail_id,)
+                )
+                for product in nvd_parsed.get("affected_products", []):
+                    cur.execute("""
+                        INSERT INTO cve_affected_products
+                            (cve_detail_id, vendor, product, version, affected_platform)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (
+                        cve_detail_id,
+                        product.get("vendor"),
+                        product.get("product"),
+                        product.get("version"),
+                        product.get("affected_platform"),
+                    ))
+
+            self.conn.commit()
+            print(f"[+] CVE {cve_id}: NVD data saved (id={cve_detail_id}).")
+            return cve_detail_id
+
+        except Exception as e:
+            self.conn.rollback()
+            print(f"[-] Error saving NVD data for {cve_id}: {e}")
+            raise
+
+    def save_cve_analysis(self, cve_id: str, chatgpt_parsed: dict) -> int:
+        """
+        Save ChatGPT analysis for a CVE. Returns the cve_analysis_id.
+
+        chatgpt_parsed is the parsed JSON from ChatGPT containing:
+            title, exploitation, mitigations, detection_recommendations,
+            vulnerability_walkthrough, mitre_attack_mapping, references
+        """
+        try:
+            # Get the cve_detail_id
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM cve_details WHERE cve_id = %s", (cve_id,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    print(f"[-] CVE {cve_id}: No NVD data found. Save NVD data first.")
+                    return -1
+                cve_detail_id = row[0]
+
+            # Upsert analysis
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO cve_analysis (
+                        cve_detail_id, title, exploitation_info,
+                        mitigations, detection_recommendations,
+                        vulnerability_walkthrough, chatgpt_references,
+                        chatgpt_raw
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (cve_detail_id) DO UPDATE SET
+                        title                     = EXCLUDED.title,
+                        exploitation_info         = EXCLUDED.exploitation_info,
+                        mitigations               = EXCLUDED.mitigations,
+                        detection_recommendations = EXCLUDED.detection_recommendations,
+                        vulnerability_walkthrough = EXCLUDED.vulnerability_walkthrough,
+                        chatgpt_references        = EXCLUDED.chatgpt_references,
+                        chatgpt_raw               = EXCLUDED.chatgpt_raw,
+                        analyzed_at               = NOW()
+                    RETURNING id
+                """, (
+                    cve_detail_id,
+                    chatgpt_parsed.get("title"),
+                    Json(chatgpt_parsed.get("exploitation", {})),
+                    Json(chatgpt_parsed.get("mitigations", [])),
+                    Json(chatgpt_parsed.get("detection_recommendations", [])),
+                    Json(chatgpt_parsed.get("vulnerability_walkthrough", [])),
+                    Json(chatgpt_parsed.get("references", [])),
+                    Json(chatgpt_parsed),
+                ))
+                analysis_id = cur.fetchone()[0]
+
+            # Delete old MITRE mappings and insert new ones
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM cve_mitre_mappings WHERE cve_analysis_id = %s",
+                    (analysis_id,)
+                )
+                for mapping in chatgpt_parsed.get("mitre_attack_mapping", []):
+                    cur.execute("""
+                        INSERT INTO cve_mitre_mappings (
+                            cve_analysis_id, tactic_id, tactic_name,
+                            technique_id, technique_name, justification
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        analysis_id,
+                        mapping.get("tactic_id"),
+                        mapping.get("tactic_name"),
+                        mapping.get("technique_id"),
+                        mapping.get("technique_name"),
+                        mapping.get("justification"),
+                    ))
+
+            self.conn.commit()
+            mitre_count = len(chatgpt_parsed.get("mitre_attack_mapping", []))
+            print(f"[+] CVE {cve_id}: ChatGPT analysis saved "
+                  f"(id={analysis_id}, {mitre_count} MITRE mappings).")
+            return analysis_id
+
+        except Exception as e:
+            self.conn.rollback()
+            print(f"[-] Error saving analysis for {cve_id}: {e}")
+            raise
+
+    def get_cve_detail(self, cve_id: str) -> dict:
+        """Get full CVE details including affected products."""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM cve_details WHERE cve_id = %s", (cve_id,)
+            )
+            detail = cur.fetchone()
+            if not detail:
+                return None
+            detail = dict(detail)
+
+            cur.execute(
+                "SELECT * FROM cve_affected_products WHERE cve_detail_id = %s",
+                (detail["id"],)
+            )
+            detail["affected_products"] = [dict(r) for r in cur.fetchall()]
+            return detail
+
+    def get_cve_full(self, cve_id: str) -> dict:
+        """Get CVE details + ChatGPT analysis + MITRE mappings."""
+        detail = self.get_cve_detail(cve_id)
+        if not detail:
+            return None
+
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM cve_analysis WHERE cve_detail_id = %s",
+                (detail["id"],)
+            )
+            analysis = cur.fetchone()
+            if analysis:
+                analysis = dict(analysis)
+                cur.execute(
+                    "SELECT * FROM cve_mitre_mappings WHERE cve_analysis_id = %s",
+                    (analysis["id"],)
+                )
+                analysis["mitre_mappings"] = [dict(r) for r in cur.fetchall()]
+                detail["analysis"] = analysis
+
+        return detail
 
 
 # ═════════════════════════════════════════════════════════════════════════════

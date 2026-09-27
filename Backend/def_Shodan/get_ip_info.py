@@ -635,6 +635,86 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Single-IP function (for Engine / LangGraph use)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scrape_single_ip(page, db, target_ip: str) -> dict:
+    """
+    Scrape a single IP using an existing Playwright page and DB connection.
+
+    This is designed for the LangGraph engine which manages its own browser
+    session and loops over IPs one at a time. Unlike get_ip_info_json(),
+    this function does NOT manage login/browser lifecycle.
+
+    Args:
+        page:       An already-logged-in Playwright page object.
+        db:         An already-connected DBManager instance.
+        target_ip:  The IP address to scrape.
+
+    Returns:
+        dict with keys:
+            - "status": "scraped" | "skipped" | "error"
+            - "ip": the target IP
+            - "data": parsed data dict (if scraped)
+            - "reason": skip/error reason string (if skipped/error)
+    """
+    target_ip = target_ip.strip()
+    if not target_ip:
+        return {"status": "error", "ip": target_ip, "reason": "Empty IP"}
+
+    # ── Deduplication Check ──────────────────────────────────────────────
+    stored_last_seen = db.get_latest_last_seen(target_ip, source="shodan")
+
+    if stored_last_seen is not None:
+        print(f"[*] IP found in database (last_seen={stored_last_seen}). Checking for updates...")
+        try:
+            page.goto(f"https://www.shodan.io/host/{target_ip}",
+                      wait_until="domcontentloaded", timeout=120000)
+            page.wait_for_timeout(2000)
+
+            if "account.shodan.io/login" in page.url:
+                return {"status": "error", "ip": target_ip, "reason": "Session expired"}
+
+            live_last_seen = quick_extract_last_seen(page)
+            print(f"    Shodan last_seen: {live_last_seen}")
+
+            if live_last_seen and live_last_seen == stored_last_seen:
+                print(f"[=] Skipping {target_ip} -- data unchanged.")
+                return {"status": "skipped", "ip": target_ip, "reason": f"unchanged (last_seen={stored_last_seen})"}
+
+            # Data changed — parse from already loaded page
+            print(f"[!] Data changed (db={stored_last_seen}, shodan={live_last_seen}). Re-scraping...")
+            html_content = page.content()
+            parsed_data = parse_shodan_host_html(html_content, ip=target_ip)
+
+            port_cve_map = extract_port_cves(page, parsed_data.get("open_ports", []))
+            for banner in parsed_data.get("port_banners", []):
+                if banner["port"] in port_cve_map:
+                    banner["cve_details"] = port_cve_map[banner["port"]]
+
+            total_cves = sum(len(b.get("cve_details", [])) for b in parsed_data.get("port_banners", []))
+            print(f"[+] Re-scraped {target_ip}: {len(parsed_data.get('open_ports', []))} ports, {total_cves} CVEs")
+
+            db.save_shodan_scan(parsed_data)
+            return {"status": "scraped", "ip": target_ip, "data": parsed_data}
+
+        except Exception as e:
+            print(f"[-] Update check failed for {target_ip}: {e}. Attempting full scrape...")
+            # Fall through to full scrape below
+
+    # ── Full scrape (new IP or fallback) ─────────────────────────────────
+    host_info = scrape_host_info(page, target_ip)
+
+    if "error" in host_info:
+        return {"status": "error", "ip": target_ip, "reason": host_info["error"]}
+
+    db.save_shodan_scan(host_info)
+    total_cves = sum(len(b.get("cve_details", [])) for b in host_info.get("port_banners", []))
+    print(f"[+] Scraped {target_ip}: {len(host_info.get('open_ports', []))} ports, {total_cves} CVEs")
+    return {"status": "scraped", "ip": target_ip, "data": host_info}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Self-test / Demo
 # ═════════════════════════════════════════════════════════════════════════════
 
