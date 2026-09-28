@@ -1,6 +1,7 @@
 # Credentials & secrets
 .env
 .accounts/
+error_json/
 
 # Virtual environment
 .venv/

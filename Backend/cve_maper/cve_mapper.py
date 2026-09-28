@@ -29,6 +29,7 @@ from playwright.sync_api import sync_playwright
 SCRIPT_DIR = Path(__file__).resolve().parent        # Backend/cve_maper/
 BACKEND_DIR = SCRIPT_DIR.parent                     # Backend/
 ENV_PATH = BACKEND_DIR.parent / ".env"              # CTI_V2/.env
+ERROR_JSON_DIR = SCRIPT_DIR / "error_json"          # debug files for failed parses
 
 # Add Backend to sys.path so we can import db_manager
 sys.path.insert(0, str(BACKEND_DIR))
@@ -375,7 +376,14 @@ Affected Products:
 References:
 {refs_str}""".strip()
 
-    prompt = f"""You are a cybersecurity vulnerability analyst. Analyze the following CVE and return ONLY valid JSON — no markdown, no explanations, no text outside the JSON object.
+    prompt = f"""You are a cybersecurity vulnerability analyst. Analyze the following CVE and return ONLY valid JSON inside a ```json code block.
+
+CRITICAL JSON RULES:
+- Output MUST be inside a ```json code block
+- Output MUST be valid, parseable JSON — no trailing commas, no comments
+- All string values must use proper JSON escaping (backslashes must be \\\\, quotes must be \\")
+- URLs must be plain strings, no markdown links
+- Do NOT include any text outside the JSON code block
 
 {nist_context}
 
@@ -391,8 +399,9 @@ Additionally, include:
 - Mitigation recommendations
 - Detection recommendations
 
-Return JSON in exactly this structure:
+Return JSON in exactly this structure inside a ```json code block:
 
+```json
 {{
   "cve_id": "{cve_id}",
   "title": "",
@@ -427,7 +436,8 @@ Return JSON in exactly this structure:
       "url": ""
     }}
   ]
-}}"""
+}}
+```"""
     return prompt
 
 
@@ -460,8 +470,8 @@ _RATE_LIMIT_TEXTS = [
 ]
 
 # Response stabilisation settings
-_POLL_INTERVAL = 0.75   # seconds between stability checks
-_STABLE_CHECKS = 2      # consecutive identical polls = "done"
+_POLL_INTERVAL = 1.0    # seconds between stability checks
+_STABLE_CHECKS = 5      # consecutive identical polls = "done"
 
 # Accounts directory
 _ACCOUNTS_DIR = Path(__file__).resolve().parent / ".accounts"
@@ -637,14 +647,36 @@ class ChatGPTSession:
                 print(f"    [ChatGPT] Pasted in {len(chunks)} chunks.")
 
             # ── Click Send ───────────────────────────────────────────────
+            # First check if send button is disabled (= message limit reached)
+            try:
+                send_btn = page.locator(_SEND_BUTTON_SELECTOR).first
+                if send_btn.count() > 0:
+                    is_disabled = send_btn.get_attribute("disabled") is not None
+                    aria_disabled = send_btn.get_attribute("aria-disabled")
+                    if is_disabled or aria_disabled == "true":
+                        print(f"    [ChatGPT] Send button is DISABLED "
+                              f"— message limit reached!")
+                        return "RATE_LIMITED"
+            except Exception:
+                pass  # if check fails, proceed to try clicking anyway
+
             try:
                 page.click(_SEND_BUTTON_SELECTOR, timeout=3000, force=True)
                 print(f"    [ChatGPT] Send button clicked.")
             except Exception:
                 if _detect_rate_limit(page):
                     return "RATE_LIMITED"
+                # Double-check: button might be disabled without rate-limit text
+                try:
+                    btn = page.locator(_SEND_BUTTON_SELECTOR).first
+                    if btn.count() > 0 and btn.get_attribute("disabled") is not None:
+                        print(f"    [ChatGPT] Send button disabled "
+                              f"— message limit reached!")
+                        return "RATE_LIMITED"
+                except Exception:
+                    pass
                 print(f"    [ChatGPT] Send button disabled or missing!")
-                return None
+                return "RATE_LIMITED"
 
             # ── Wait for full response ───────────────────────────────────
             response_text = self._wait_for_new_response(pre_count)
@@ -661,6 +693,9 @@ class ChatGPTSession:
         Wait for a NEW assistant message and for it to stabilise.
         Uses the stop-generating button appear/disappear strategy with
         robust fallbacks for large prompts.
+
+        After stabilisation, verifies JSON completeness — if the response
+        looks like truncated JSON (no closing `}`), continues polling.
         """
         page = self._page
 
@@ -738,11 +773,11 @@ class ChatGPTSession:
                     return None
 
         # Step 3: Stabilization poll — wait for text to stop changing
-        # Use a longer window (30s) and more checks (5) to avoid
-        # declaring "stable" on a brief ChatGPT pause mid-generation
+        # After stop button disappears, ChatGPT may still be rendering.
+        # Poll until text is stable for _STABLE_CHECKS consecutive checks.
         previous_text = ""
         stable_count = 0
-        deadline = time.time() + 30  # 30 seconds for stabilization
+        deadline = time.time() + 60  # 60 seconds for stabilization
 
         while time.time() < deadline:
             elements = page.query_selector_all(_ASSISTANT_SELECTOR)
@@ -761,7 +796,7 @@ class ChatGPTSession:
 
             if current_text == previous_text:
                 stable_count += 1
-                if stable_count >= 5:  # stable for 3.75s (5 × 0.75s)
+                if stable_count >= _STABLE_CHECKS:  # stable for 5s (5 × 1.0s)
                     print(f"    [ChatGPT] Response stabilised "
                           f"({len(current_text)} chars, "
                           f"{stable_count * _POLL_INTERVAL:.1f}s stable)")
@@ -772,15 +807,61 @@ class ChatGPTSession:
             previous_text = current_text
             time.sleep(_POLL_INTERVAL)
 
-        # Step 4: Final extraction
-        elements = page.query_selector_all(_ASSISTANT_SELECTOR)
-        if not elements or len(elements) <= prev_count:
+        # Step 4: JSON completeness check
+        # If response looks like JSON but doesn't end with }, keep polling
+        # (ChatGPT may have paused mid-generation)
+        final_text = self._extract_response_text(prev_count)
+        if final_text and _looks_like_json(final_text) and not _json_looks_complete(final_text):
+            print(f"    [ChatGPT] JSON looks incomplete "
+                  f"({len(final_text)} chars, ends: '{final_text[-40:]}'). "
+                  f"Polling for completion...")
+            json_deadline = time.time() + 60  # extra 60s for JSON completion
+            prev_len = len(final_text)
+            json_stable = 0
+            while time.time() < json_deadline:
+                time.sleep(2)
+                check_text = self._extract_response_text(prev_count)
+                if not check_text:
+                    continue
+
+                # Check if stop button reappeared (ChatGPT continued)
+                try:
+                    stop_loc = page.locator(_STOP_BUTTON_SELECTOR)
+                    if stop_loc.count() > 0 and stop_loc.first.is_visible():
+                        print(f"    [ChatGPT] Generation resumed, waiting...")
+                        page.wait_for_selector(
+                            _STOP_BUTTON_SELECTOR,
+                            state="hidden",
+                            timeout=RESPONSE_TIMEOUT * 1000,
+                        )
+                        json_stable = 0
+                        continue
+                except Exception:
+                    pass
+
+                if _json_looks_complete(check_text):
+                    print(f"    [ChatGPT] JSON now complete "
+                          f"({len(check_text)} chars)")
+                    final_text = check_text
+                    break
+
+                if len(check_text) == prev_len:
+                    json_stable += 1
+                    if json_stable >= 3:  # 6s stable but still incomplete
+                        print(f"    [ChatGPT] JSON still incomplete after 6s "
+                              f"stable. Extracting what we have.")
+                        final_text = check_text
+                        break
+                else:
+                    json_stable = 0
+                    prev_len = len(check_text)
+                    final_text = check_text
+
+        if not final_text:
             if _detect_rate_limit(page):
                 return "RATE_LIMITED"
             print(f"    [ChatGPT] No assistant response found!")
             return None
-
-        final_text = elements[-1].inner_text().strip()
 
         # Safety check — if still a placeholder, something went wrong
         if final_text.lower() in _PLACEHOLDER_TEXTS or len(final_text) < 50:
@@ -790,6 +871,52 @@ class ChatGPTSession:
 
         print(f"    [ChatGPT] Got response ({len(final_text)} chars)")
         return final_text
+
+    def _extract_response_text(self, prev_count: int) -> str:
+        """
+        Extract the latest assistant response text from the page.
+
+        Tries multiple strategies:
+        1. Extract from <code> block inside the assistant message
+           (cleaner text, no inner_text artifacts)
+        2. Fall back to inner_text() of the entire message
+        """
+        page = self._page
+        elements = page.query_selector_all(_ASSISTANT_SELECTOR)
+        if not elements or len(elements) <= prev_count:
+            return None
+
+        last_msg = elements[-1]
+
+        # Strategy 1: Try to get text from a <code> block
+        # ChatGPT wraps JSON in ```json ... ``` which renders as <pre><code>
+        try:
+            code_blocks = last_msg.query_selector_all("pre code")
+            if code_blocks:
+                # Use the largest code block (likely the JSON)
+                code_texts = []
+                for cb in code_blocks:
+                    ct = cb.text_content().strip()
+                    if ct:
+                        code_texts.append(ct)
+                if code_texts:
+                    largest = max(code_texts, key=len)
+                    if len(largest) > 100 and '{' in largest:
+                        print(f"    [ChatGPT] Extracted from code block "
+                              f"({len(largest)} chars)")
+                        return largest
+        except Exception:
+            pass
+
+        # Strategy 2: Fall back to inner_text()
+        try:
+            text = last_msg.inner_text().strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+        return None
 
     def is_rate_limited(self, response: str) -> bool:
         """Check if the response indicates a rate limit."""
@@ -812,15 +939,44 @@ class ChatGPTSession:
 # Response Parser
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _looks_like_json(text: str) -> bool:
+    """Return True if text appears to start with JSON."""
+    stripped = text.lstrip()
+    # Check for { or ```json with {
+    if stripped.startswith('{'):
+        return True
+    if stripped.startswith('```'):
+        rest = re.sub(r'^```(?:json)?\s*', '', stripped)
+        return rest.lstrip().startswith('{')
+    return False
+
+
+def _json_looks_complete(text: str) -> bool:
+    """Return True if the JSON response looks structurally complete."""
+    stripped = text.rstrip()
+    # Strip trailing code fence
+    stripped = re.sub(r'\s*```\s*$', '', stripped).rstrip()
+    # Should end with } for a complete JSON object
+    if not stripped.endswith('}'):
+        return False
+    # Quick bracket balance check
+    opens = stripped.count('{')
+    closes = stripped.count('}')
+    return closes >= opens
+
+
 def parse_chatgpt_response(response_text: str) -> dict:
     """
     Parse ChatGPT's response text into a JSON dict.
 
     Handles:
       - Markdown code fences (```json ... ``` or ``` ... ```)
-      - Literal newlines inside JSON string values (common GPT artifact)
       - Extra text before/after the JSON object
     Returns None if parsing fails.
+
+    NOTE: We rely on _extract_response_text() to get clean text from
+    <pre><code> blocks. If ChatGPT generates invalid JSON, that's a
+    prompt issue — fix the prompt, don't patch the JSON.
     """
     if not response_text:
         return None
@@ -831,7 +987,7 @@ def parse_chatgpt_response(response_text: str) -> dict:
     cleaned = re.sub(r'^```(?:json)?\s*', '', text)
     cleaned = re.sub(r'\s*```$', '', cleaned.strip())
 
-    # Attempt 1: Direct parse
+    # Attempt 1: Direct parse (text from <code> blocks is usually clean)
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, dict):
@@ -839,18 +995,8 @@ def parse_chatgpt_response(response_text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Attempt 2: Replace literal newlines/carriage returns with spaces
-    # (ChatGPT often puts actual line breaks inside JSON string values)
-    sanitized = cleaned.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
-    try:
-        parsed = json.loads(sanitized)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 3: Extract the outermost { … } from the sanitized text
-    match = re.search(r'\{.*\}', sanitized, re.DOTALL)
+    # Attempt 2: Extract the outermost { … } (skip any surrounding text)
+    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
     if match:
         try:
             parsed = json.loads(match.group(0))
@@ -859,7 +1005,7 @@ def parse_chatgpt_response(response_text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Attempt 4: Try the original regex approach on unsanitized text
+    # Attempt 3: Try code-fence block extraction from original text
     json_block = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
     if json_block:
         block_text = json_block.group(1).strip()
@@ -868,14 +1014,7 @@ def parse_chatgpt_response(response_text: str) -> dict:
             if isinstance(parsed, dict):
                 return parsed
         except json.JSONDecodeError:
-            # Try sanitizing this block too
-            block_sanitized = block_text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
-            try:
-                parsed = json.loads(block_sanitized)
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
+            pass
 
     # All attempts failed
     print(f"    [!] JSON parse failed. Response preview: "
@@ -1129,11 +1268,12 @@ def run_pipeline(cve_list: list):
             else:
                 print(f"    [!] Failed to parse JSON response.")
                 print(f"    [!] Response starts with: {response[:150]}")
-                # Save raw response for debugging
-                debug_file = SCRIPT_DIR / f"debug_{cve_id}.txt"
+                # Save raw response for debugging in error_json/ folder
+                ERROR_JSON_DIR.mkdir(exist_ok=True)
+                debug_file = ERROR_JSON_DIR / f"debug_{cve_id}.txt"
                 with open(debug_file, "w", encoding="utf-8") as f:
                     f.write(response)
-                print(f"    [!] Raw response saved to: {debug_file.name}")
+                print(f"    [!] Raw response saved to: error_json/{debug_file.name}")
                 retry_queue.append(cve_id)
                 failed += 1
 
@@ -1170,14 +1310,23 @@ def run_pipeline(cve_list: list):
                         db.save_cve_analysis(cve_id, parsed)
                         completed += 1
                         print(f"    [+] Retry succeeded!")
+                        # Delete debug file on successful retry
+                        _cleanup_debug_file(cve_id)
                     elif parsed:
                         # Partial data — save anyway
                         db.save_cve_analysis(cve_id, parsed)
                         completed += 1
                         print(f"    [~] Retry partial save (keys: {list(parsed.keys())})")
+                        # Delete debug file since we got usable data
+                        _cleanup_debug_file(cve_id)
                     else:
                         still_failed.append(cve_id)
                         print(f"    [!] Retry failed (bad JSON).")
+                        # Save new debug file for this retry attempt
+                        ERROR_JSON_DIR.mkdir(exist_ok=True)
+                        debug_file = ERROR_JSON_DIR / f"debug_{cve_id}.txt"
+                        with open(debug_file, "w", encoding="utf-8") as f:
+                            f.write(response)
                 else:
                     still_failed.append(cve_id)
                     print(f"    [!] Retry failed (no response).")
@@ -1202,6 +1351,19 @@ def run_pipeline(cve_list: list):
     print(f"{'=' * 60}")
 
     db.close()
+
+
+def _cleanup_debug_file(cve_id: str):
+    """Delete the debug file for a CVE after successful parse."""
+    # Check both old location (SCRIPT_DIR) and new location (error_json/)
+    for parent in (ERROR_JSON_DIR, SCRIPT_DIR):
+        debug_file = parent / f"debug_{cve_id}.txt"
+        if debug_file.exists():
+            try:
+                debug_file.unlink()
+                print(f"    [cleanup] Deleted {debug_file.relative_to(SCRIPT_DIR)}")
+            except OSError as e:
+                print(f"    [cleanup] Could not delete {debug_file.name}: {e}")
 
 
 def _try_next_account(session: ChatGPTSession, rotator: AccountRotator) -> bool:
