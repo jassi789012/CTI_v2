@@ -283,34 +283,69 @@ def scrape_query(page, query):
     return all_ips
 
 
-# ─── Main query function ────────────────────────────────────────────────────
-def get_ip_query_ip(queries):
+# ═════════════════════════════════════════════════════════════════════════════
+# Generator Function
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_ip_query_ip_gen(queries):
     """
-    Authenticate with Shodan and scrape IPs for a list of search queries.
+    Generator that scrapes IPs from Shodan for a list of search queries.
+
+    Yields progress dicts after each query is scraped:
+        {
+            "ip_number_fetcher": "running" | "completed",
+            "ip_number_fetcher_done": "n/m",
+            "ips": [list of unique IPs found so far],
+        }
+
+    The last yielded dict contains the final result in "ips".
 
     Args:
         queries: A list of Shodan search query strings.
-                 Example: ["port:80", "apache country:US", "nginx city:Delhi"]
-
-    Returns:
-        A list of unique IP addresses (IPv4 + IPv6) found across all queries.
     """
+    if not queries:
+        yield {
+            "ip_number_fetcher": "completed",
+            "ip_number_fetcher_done": "0/0",
+            "ips": [],
+        }
+        return
+
+    total = len(queries)
+    yield {
+        "ip_number_fetcher": "running",
+        "ip_number_fetcher_done": f"0/{total}",
+        "ips": [],
+    }
+
+    # Login to Shodan
     result = shodan_login()
     if result is None:
-        return []
+        yield {
+            "ip_number_fetcher": "completed",
+            "ip_number_fetcher_done": f"0/{total}",
+            "ips": [],
+        }
+        return
 
     pw, browser, context, page = result
     all_ips = set()
 
     try:
         for idx, query in enumerate(queries, start=1):
-            print(f"\n[*] Query {idx}/{len(queries)}: \"{query}\"")
+            print(f"\n[*] Query {idx}/{total}: \"{query}\"")
             query_ips = scrape_query(page, query)
             all_ips.update(query_ips)
             print(f"[+] Total unique IPs so far: {len(all_ips)}")
 
+            yield {
+                "ip_number_fetcher": "running",
+                "ip_number_fetcher_done": f"{idx}/{total}",
+                "ips": list(all_ips),
+            }
+
             # Delay between queries
-            if idx < len(queries):
+            if idx < total:
                 time.sleep(PAGE_DELAY_SECONDS)
 
         print(f"\n[+] Scraping complete. Total unique IPs collected: {len(all_ips)}")
@@ -319,7 +354,33 @@ def get_ip_query_ip(queries):
         browser.close()
         pw.stop()
 
-    return list(all_ips)
+    yield {
+        "ip_number_fetcher": "completed",
+        "ip_number_fetcher_done": f"{total}/{total}",
+        "ips": list(all_ips),
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Synchronous Wrapper
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_ip_query_ip(queries):
+    """
+    Synchronous wrapper — returns list of unique IPs.
+
+    Internally consumes get_ip_query_ip_gen() and returns the final result.
+
+    Args:
+        queries: A list of Shodan search query strings.
+
+    Returns:
+        A list of unique IP addresses found across all queries.
+    """
+    progress = None
+    for progress in get_ip_query_ip_gen(queries):
+        pass
+    return progress.get("ips", []) if progress else []
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
@@ -328,7 +389,14 @@ if __name__ == "__main__":
         "port:80",
         "apache country:IN",
     ]
-    ips = get_ip_query_ip(test_queries)
+
+    progress = None
+    for progress in get_ip_query_ip_gen(test_queries):
+        status = progress["ip_number_fetcher"]
+        done = progress["ip_number_fetcher_done"]
+        print(f"  [{status}] {done}")
+
+    ips = progress.get("ips", []) if progress else []
     print(f"\nExtracted IPs ({len(ips)}):")
     for ip in ips:
         print(f"  {ip}")

@@ -489,38 +489,43 @@ def scrape_host_info(page, ip: str) -> dict:
         }
 
 
-def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
+def get_ip_info_gen(ip_list):
     """
-    Main entry point to fetch and parse Shodan host details for one or more IPs.
+    Generator that scrapes Shodan host details for a list of IPs.
 
-    Features:
-      - PostgreSQL storage: data is split across hosts, scans, ports,
-        vulnerabilities, and technologies tables.
-      - Deduplication: if an IP's last_seen date hasn't changed in the DB, it's skipped.
-      - Crash recovery: results are committed after each IP. On restart, IPs already
-        in the database with matching last_seen are skipped (page is still loaded
-        briefly to compare last_seen dates).
-      - Port-specific CVEs via live Playwright dropdown interaction.
+    Yields progress dicts after each IP is processed:
+        {
+            "ip_data_fetcher_shodan": "running" | "completed",
+            "ip_data_fetcher_shodan_done": "n/m",
+        }
 
-    Parameters:
-      ip: A single IP string or a list/iterable of IP strings.
-      output_file: (Legacy) Path to JSON results file. No longer used for primary
-                   storage but kept for API compatibility.
+    Data goes directly to the database — not returned in the yields.
 
-    Returns:
-      If a single IP string: the data dict for that IP (or None if skipped).
-      If a list of IPs: list of data dicts for IPs that were actually scraped.
+    Args:
+        ip_list: List of IP address strings.
     """
-    is_single = isinstance(ip, str)
-    if is_single:
-        stripped = ip.strip()
-        ip_list = [stripped] if stripped else []
-    else:
-        ip_list = [str(item).strip() for item in ip if str(item).strip()]
-
     if not ip_list:
-        print("[-] No valid IP addresses provided.")
-        return {} if is_single else []
+        yield {
+            "ip_data_fetcher_shodan": "completed",
+            "ip_data_fetcher_shodan_done": "0/0",
+        }
+        return
+
+    # Normalize the IP list
+    clean_ips = [str(ip).strip() for ip in ip_list if str(ip).strip()]
+    total = len(clean_ips)
+
+    if not clean_ips:
+        yield {
+            "ip_data_fetcher_shodan": "completed",
+            "ip_data_fetcher_shodan_done": "0/0",
+        }
+        return
+
+    yield {
+        "ip_data_fetcher_shodan": "running",
+        "ip_data_fetcher_shodan_done": f"0/{total}",
+    }
 
     # ── Connect to PostgreSQL ────────────────────────────────────────────
     try:
@@ -529,9 +534,13 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
     except Exception as e:
         print(f"[-] Database connection failed: {e}")
         print("[-] Cannot proceed without database.")
-        return {} if is_single else []
+        yield {
+            "ip_data_fetcher_shodan": "completed",
+            "ip_data_fetcher_shodan_done": f"0/{total}",
+        }
+        return
 
-    print(f"[*] Starting Shodan host information scraper for {len(ip_list)} IP(s)...")
+    print(f"[*] Starting Shodan host information scraper for {total} IP(s)...")
     print(f"    Storage: PostgreSQL ({db.conn.info.dbname}@{db.conn.info.host})")
 
     # Log in to Shodan
@@ -539,16 +548,18 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
     if not result:
         print("[-] Login failed. Cannot proceed with host scraping.")
         db.close()
-        return {} if is_single else []
+        yield {
+            "ip_data_fetcher_shodan": "completed",
+            "ip_data_fetcher_shodan_done": f"0/{total}",
+        }
+        return
 
     pw, browser, context, page = result
-    scraped_results = []
-    skipped_count = 0
 
     try:
-        for idx, target_ip in enumerate(ip_list, start=1):
+        for idx, target_ip in enumerate(clean_ips, start=1):
             print(f"\n{'='*60}")
-            print(f"[{idx}/{len(ip_list)}] Processing IP: {target_ip}")
+            print(f"[{idx}/{total}] Processing IP: {target_ip}")
             print(f"{'='*60}")
 
             # ── Crash Recovery Check (from database) ─────────────────────
@@ -572,8 +583,11 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
 
                     if live_last_seen and live_last_seen == stored_last_seen:
                         print(f"[=] Skipping {target_ip} -- data unchanged (last_seen={stored_last_seen}).")
-                        skipped_count += 1
-                        if idx < len(ip_list):
+                        yield {
+                            "ip_data_fetcher_shodan": "running",
+                            "ip_data_fetcher_shodan_done": f"{idx}/{total}",
+                        }
+                        if idx < total:
                             time.sleep(HOST_DELAY_SECONDS)
                         continue
                     else:
@@ -592,7 +606,6 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
                         print(f"[+] Re-scraped {target_ip}: {len(parsed_data.get('open_ports',[]))} ports, {total_cves} CVEs")
 
                         db.save_shodan_scan(parsed_data)
-                        scraped_results.append(parsed_data)
 
                 except Exception as e:
                     print(f"[-] Error during update check for {target_ip}: {e}")
@@ -600,27 +613,25 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
                     host_info = scrape_host_info(page, target_ip)
                     if "error" not in host_info:
                         db.save_shodan_scan(host_info)
-                        scraped_results.append(host_info)
             else:
                 # ── New IP — full scrape ─────────────────────────────────
                 host_info = scrape_host_info(page, target_ip)
                 if "error" not in host_info:
                     db.save_shodan_scan(host_info)
-                    scraped_results.append(host_info)
                 else:
                     print(f"[-] Could not scrape {target_ip}: {host_info.get('error')}")
 
+            yield {
+                "ip_data_fetcher_shodan": "running",
+                "ip_data_fetcher_shodan_done": f"{idx}/{total}",
+            }
+
             # Polite delay between IPs
-            if idx < len(ip_list):
+            if idx < total:
                 time.sleep(HOST_DELAY_SECONDS)
 
-        # ── Summary ──────────────────────────────────────────────────────
         print(f"\n{'='*60}")
-        print(f"[DONE] Scraping complete.")
-        print(f"    Total IPs processed: {len(ip_list)}")
-        print(f"    Scraped (new/updated): {len(scraped_results)}")
-        print(f"    Skipped (unchanged):   {skipped_count}")
-        print(f"    Storage: PostgreSQL ({db.conn.info.dbname})")
+        print(f"[DONE] Scraping complete. Total IPs processed: {total}")
         print(f"{'='*60}")
 
     finally:
@@ -629,9 +640,52 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
         pw.stop()
         db.close()
 
+    yield {
+        "ip_data_fetcher_shodan": "completed",
+        "ip_data_fetcher_shodan_done": f"{total}/{total}",
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Synchronous Wrapper
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
+    """
+    Main entry point to fetch and parse Shodan host details for one or more IPs.
+
+    Internally consumes get_ip_info_gen() for progress tracking.
+
+    Features:
+      - PostgreSQL storage: data is split across hosts, scans, ports,
+        vulnerabilities, and technologies tables.
+      - Deduplication: if an IP's last_seen date hasn't changed in the DB, it's skipped.
+      - Crash recovery: results are committed after each IP. On restart, IPs already
+        in the database with matching last_seen are skipped (page is still loaded
+        briefly to compare last_seen dates).
+      - Port-specific CVEs via live Playwright dropdown interaction.
+
+    Parameters:
+      ip: A single IP string or a list/iterable of IP strings.
+      output_file: (Legacy) Path to JSON results file. No longer used for primary
+                   storage but kept for API compatibility.
+
+    Returns:
+      None — data is saved directly to the database.
+    """
+    is_single = isinstance(ip, str)
     if is_single:
-        return scraped_results[0] if scraped_results else None
-    return scraped_results
+        stripped = ip.strip()
+        ip_list = [stripped] if stripped else []
+    else:
+        ip_list = [str(item).strip() for item in ip if str(item).strip()]
+
+    if not ip_list:
+        print("[-] No valid IP addresses provided.")
+        return
+
+    for progress in get_ip_info_gen(ip_list):
+        pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════

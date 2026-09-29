@@ -14,9 +14,15 @@ Stack:
     - Pydantic:   Structured output parsing
 
 Usage:
-    from query_gen_ai import generate_queries
+    from query_gen_ai import generate_queries, generate_queries_gen
+
+    # Synchronous
     queries = generate_queries("find apache servers in India")
-    # Returns: ["apache country:IN", "apache city:Mumbai", ...]
+
+    # Generator (yields progress)
+    for progress in generate_queries_gen("find apache servers in India"):
+        print(progress["query_generator"])
+    queries = progress["queries"]
 """
 
 import sys
@@ -109,99 +115,6 @@ NEVER use vuln:, has_vuln:, or tag: in any query. Use alternative filters instea
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Core Function
-# ═════════════════════════════════════════════════════════════════════════════
-
-def generate_queries(user_query: str, count: int = DEFAULT_QUERY_COUNT) -> list[str]:
-    """
-    Generate multiple Shodan search queries from a natural language input.
-
-    Uses ChatGroq with Pydantic structured output to expand a single user
-    query into multiple Shodan queries matching the same intent.
-
-    Args:
-        user_query:  Natural language description of what to search.
-        count:       Number of queries to generate (default 10).
-
-    Returns:
-        list[str] — List of valid Shodan query strings.
-    """
-    if not user_query or not user_query.strip():
-        print("[-] Empty query provided.")
-        return []
-
-    print("=" * 60)
-    print("  SHODAN QUERY GENERATOR")
-    print("=" * 60)
-    print(f"  User query : {user_query}")
-    print(f"  Model      : {GROQ_MODEL}")
-    print(f"  Target     : {count} queries")
-    print("=" * 60)
-
-    # ── 1. Build the LLM with structured output ──────────────────────────
-    print("\n[*] Initializing ChatGroq...")
-    llm = ChatGroq(model=GROQ_MODEL, temperature=0.7)
-
-    # .with_structured_output() forces the LLM to return our Pydantic schema
-    structured_llm = llm.with_structured_output(ShodanQueries)
-
-    # ── 2. Build the prompt ──────────────────────────────────────────────
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("human",
-         "Generate exactly {count} Shodan search queries for this request:\n\n"
-         "\"{user_query}\"\n\n"
-         "Return exactly {count} unique query strings."),
-    ])
-
-    # ── 3. Chain: prompt → LLM → Pydantic parsed output ─────────────────
-    chain = prompt | structured_llm
-
-    # ── 4. Invoke the chain ──────────────────────────────────────────────
-    print("[*] Generating queries with LLM...")
-
-    try:
-        result: ShodanQueries = chain.invoke({
-            "user_query": user_query,
-            "count": count,
-        })
-    except Exception as e:
-        print(f"[-] LLM call failed: {e}")
-        return []
-
-    queries = result.queries
-    print(f"[*] LLM returned {len(queries)} queries")
-
-    # ── 5. Deduplicate (preserve order) ──────────────────────────────────
-    seen = set()
-    unique = []
-    for q in queries:
-        q = q.strip()
-        if q and q not in seen:
-            seen.add(q)
-            unique.append(q)
-
-    # ── 6. Remove queries with restricted (paid-only) filters ────────────
-    valid, removed = _filter_restricted(unique)
-
-    if removed:
-        print(f"\n[!] Removed {len(removed)} queries with restricted filters:")
-        for rq in removed:
-            print(f"    BLOCKED: {rq}")
-
-    if not valid:
-        print("[-] All generated queries were blocked (used paid-only filters).")
-        return []
-
-    # ── 7. Print results ─────────────────────────────────────────────────
-    print(f"\n[+] Generated {len(valid)} valid queries:")
-    for i, q in enumerate(valid, 1):
-        print(f"    {i}. {q}")
-
-    return valid
-
-
-# ═════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -226,6 +139,116 @@ def _filter_restricted(queries: list[str]) -> tuple[list[str], list[str]]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Generator Function
+# ═════════════════════════════════════════════════════════════════════════════
+
+def generate_queries_gen(user_query: str, count: int = DEFAULT_QUERY_COUNT):
+    """
+    Generator that produces Shodan queries from a natural language input.
+
+    Yields progress dicts:
+        {
+            "query_generator": "running" | "completed",
+            "queries": [list of valid Shodan query strings],
+        }
+
+    The last yielded dict contains the final result in "queries".
+
+    Args:
+        user_query:  Natural language description of what to search.
+        count:       Number of queries to generate (default 10).
+    """
+    if not user_query or not user_query.strip():
+        yield {"query_generator": "completed", "queries": []}
+        return
+
+    yield {"query_generator": "running", "queries": []}
+
+    # ── 1. Build the LLM with structured output ──────────────────────────
+    print("[*] Initializing ChatGroq...")
+    llm = ChatGroq(model=GROQ_MODEL, temperature=0.7)
+    structured_llm = llm.with_structured_output(ShodanQueries)
+
+    # ── 2. Build the prompt ──────────────────────────────────────────────
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT),
+        ("human",
+         "Generate exactly {count} Shodan search queries for this request:\n\n"
+         "\"{user_query}\"\n\n"
+         "Return exactly {count} unique query strings."),
+    ])
+
+    # ── 3. Chain: prompt → LLM → Pydantic parsed output ─────────────────
+    chain = prompt | structured_llm
+
+    # ── 4. Invoke the chain ──────────────────────────────────────────────
+    print("[*] Generating queries with LLM...")
+
+    try:
+        result: ShodanQueries = chain.invoke({
+            "user_query": user_query,
+            "count": count,
+        })
+    except Exception as e:
+        print(f"[-] LLM call failed: {e}")
+        yield {"query_generator": "completed", "queries": []}
+        return
+
+    queries = result.queries
+    print(f"[*] LLM returned {len(queries)} queries")
+
+    # ── 5. Deduplicate (preserve order) ──────────────────────────────────
+    seen = set()
+    unique = []
+    for q in queries:
+        q = q.strip()
+        if q and q not in seen:
+            seen.add(q)
+            unique.append(q)
+
+    # ── 6. Remove queries with restricted (paid-only) filters ────────────
+    valid, removed = _filter_restricted(unique)
+
+    if removed:
+        print(f"\n[!] Removed {len(removed)} queries with restricted filters:")
+        for rq in removed:
+            print(f"    BLOCKED: {rq}")
+
+    if not valid:
+        print("[-] All generated queries were blocked (used paid-only filters).")
+        yield {"query_generator": "completed", "queries": []}
+        return
+
+    # ── 7. Final result ──────────────────────────────────────────────────
+    print(f"[+] Generated {len(valid)} valid queries")
+
+    yield {"query_generator": "completed", "queries": valid}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Synchronous Wrapper
+# ═════════════════════════════════════════════════════════════════════════════
+
+def generate_queries(user_query: str, count: int = DEFAULT_QUERY_COUNT) -> list[str]:
+    """
+    Synchronous wrapper — returns list of Shodan query strings.
+
+    Internally consumes generate_queries_gen() and returns the final result.
+
+    Args:
+        user_query:  Natural language description of what to search.
+        count:       Number of queries to generate (default 10).
+
+    Returns:
+        list[str] — List of valid Shodan query strings.
+    """
+    progress = None
+    for progress in generate_queries_gen(user_query, count):
+        pass
+    return progress.get("queries", []) if progress else []
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # CLI Entry Point
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -243,9 +266,17 @@ def main():
     count_input = input("  How many queries? (default 10): ").strip()
     count = int(count_input) if count_input.isdigit() else DEFAULT_QUERY_COUNT
 
-    queries = generate_queries(query, count)
+    progress = None
+    for progress in generate_queries_gen(query, count):
+        status = progress["query_generator"]
+        print(f"  [{status}]")
+
+    queries = progress.get("queries", []) if progress else []
 
     if queries:
+        print(f"\n[+] {len(queries)} queries generated:")
+        for i, q in enumerate(queries, 1):
+            print(f"    {i}. {q}")
         print(f"\n[+] Copy these into your scraper:")
         print(f"    {queries}")
 

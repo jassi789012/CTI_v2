@@ -1,15 +1,11 @@
 """
 CTI Engine — IP Input Pipeline (LangGraph)
-============================================
+===========================================
 Partial pipeline: Takes a list of IPs directly and runs parallel
 data collection (Shodan scraping + Nmap scanning).
 
 Skips query generation and IP discovery — use this when you already
 have the target IPs.
-
-Usage:
-    from Engine_ip_input import run_engine
-    result = run_engine(["1.2.3.4", "5.6.7.8"], thread_id="ips_001")
 """
 
 import os
@@ -22,13 +18,17 @@ from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.postgres import PostgresSaver
 
 # ─── Reuse from the query-input engine ───────────────────────────────────────
-BACKEND_DIR = Path(__file__).parent
+BACKEND_DIR = Path(r"c:\Users\jassi\OneDrive\Documents\CTI_V2\Backend")
 sys.path.insert(0, str(BACKEND_DIR))
 
 from Engine_query_input import (
     EngineState,
     process_all_ips_node,
+    extract_cves_node,
+    cve_mapper_node,
     summary_node,
+    _list_thread_ids,
+    _get_threads_with_state,
 )
 
 # ─── Load .env ───────────────────────────────────────────────────────────────
@@ -43,14 +43,13 @@ PG_CONN_STRING = (
     f"{os.getenv('PG_DATABASE', 'cti_db')}"
 )
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Init Node (replaces query_gen + get_ip for IP-input mode)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def init_ips_node(state: EngineState) -> dict:
     """Initialize state from the provided IP list."""
-    ips = state.get("discovered_ips", [])
+    ips = state.get("ips", [])
 
     # Deduplicate while preserving order
     seen = set()
@@ -68,15 +67,13 @@ def init_ips_node(state: EngineState) -> dict:
 
     if not unique_ips:
         return {
-            "discovered_ips": [],
-            "current_step": "error",
-            "status_message": "No valid IPs provided",
+            "ips": [],
+            "engine_status": "error",
         }
 
     return {
-        "discovered_ips": unique_ips,
-        "current_step": "ips_initialized",
-        "status_message": f"Ready to process {len(unique_ips)} IPs",
+        "ips": unique_ips,
+        "engine_status": "running",
     }
 
 
@@ -85,25 +82,25 @@ def init_ips_node(state: EngineState) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _route_after_init(state: EngineState) -> str:
-    """Conditional edge: after init, check if we have IPs."""
-    if state.get("discovered_ips"):
+    if state.get("ips"):
         return "process_all_ips"
     return "summary"
 
 
 def build_graph():
-    """Build the LangGraph state graph for the IP-input engine."""
     workflow = StateGraph(EngineState)
 
-    # Add nodes (reuses process + summary from query-input engine)
     workflow.add_node("init_ips", init_ips_node)
     workflow.add_node("process_all_ips", process_all_ips_node)
+    workflow.add_node("extract_cves", extract_cves_node)
+    workflow.add_node("cve_mapper", cve_mapper_node)
     workflow.add_node("summary", summary_node)
 
-    # Wire edges: init_ips → process_all_ips → summary
     workflow.set_entry_point("init_ips")
     workflow.add_conditional_edges("init_ips", _route_after_init)
-    workflow.add_edge("process_all_ips", "summary")
+    workflow.add_edge("process_all_ips", "extract_cves")
+    workflow.add_edge("extract_cves", "cve_mapper")
+    workflow.add_edge("cve_mapper", "summary")
     workflow.add_edge("summary", END)
 
     return workflow
@@ -117,16 +114,6 @@ def run_engine(
     ips: list[str],
     thread_id: str = None,
 ) -> dict:
-    """
-    Run the IP-input CTI engine pipeline.
-
-    Args:
-        ips:          List of IP addresses to process.
-        thread_id:    Unique ID for this run (for checkpoint resume).
-
-    Returns:
-        Final EngineState dict with all results.
-    """
     if not thread_id:
         thread_id = f"ips_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -143,47 +130,44 @@ def run_engine(
         graph = workflow.compile(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": thread_id}}
 
-        # Check for existing checkpoint
         existing_state = graph.get_state(config)
         if existing_state and existing_state.values:
-            step = existing_state.values.get("current_step", "")
-            if step == "complete":
+            if existing_state.values.get("engine_status") == "complete":
                 print(f"[*] Run '{thread_id}' already completed.")
                 return existing_state.values
             else:
-                print(f"[*] Resuming run '{thread_id}' from step: {step}")
-                final_state = graph.invoke(None, config)
-                return final_state
+                print(f"[*] Resuming run '{thread_id}'")
+                return graph.invoke(None, config)
 
-        # Fresh run
         initial_state = {
-            "user_query": "",
-            "query_count": 0,
-            "generated_queries": [],
-            "discovered_ips": ips,
-            "shodan_results": [],
-            "nmap_results": [],
-            "shodan_errors": [],
-            "nmap_errors": [],
-            "current_step": "starting",
-            "status_message": "Engine starting...",
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "finished_at": "",
+            "query": "",
+            "queries": [],
+            "ips": ips,
+            "cve": [],
+            "engine_status": "running",
+            "query_genrater": "skipped",
+            "ip_number_fetcher": "skipped",
+            "ip_number_fetcher_done": "0/0",
+            "ip_data_fetcher_shodan": "waiting for ips",
+            "ip_data_fetcher_shodan_done": "0/0",
+            "ip_data_fetcher_nmap": "waiting for ips",
+            "ip_data_fetcher_nmap_done": "0/0",
+            "cve_extractor": "waiting for ips",
+            "cve_extractor_done": "0/0",
+            "cve_mapper_nvd": "waiting for cves",
+            "cve_mapper_nvd_done": "0/0",
+            "cve_mapper_gpt": "waiting for cves",
+            "cve_mapper_gpt_done": "0/0",
         }
 
-        final_state = graph.invoke(initial_state, config)
-        return final_state
-
+        return graph.invoke(initial_state, config)
 
 def get_engine_status(thread_id: str) -> dict:
-    """Read the current state of an engine run without invoking it."""
     workflow = build_graph()
-
     with PostgresSaver.from_conn_string(PG_CONN_STRING) as checkpointer:
         checkpointer.setup()
         graph = workflow.compile(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": thread_id}}
-
         state = graph.get_state(config)
         if state and state.values:
             return state.values
@@ -195,19 +179,71 @@ def get_engine_status(thread_id: str) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main():
-    """CLI — pass IP addresses as arguments."""
-    if len(sys.argv) < 2:
-        print("Usage: python Engine_ip_input.py <ip1> [ip2] [ip3] ...")
+    print(f"\n{'=' * 60}")
+    print(f"  CTI ENGINE — IP Input Pipeline")
+    print(f"{'=' * 60}")
+
+    workflow = build_graph()
+    threads = []
+    try:
+        with PostgresSaver.from_conn_string(PG_CONN_STRING) as checkpointer:
+            checkpointer.setup()
+            graph = workflow.compile(checkpointer=checkpointer)
+            threads = _get_threads_with_state("ips_", graph)
+    except Exception:
+        pass
+
+    chosen_thread = None
+
+    if threads:
+        print(f"\n  [*] Found {len(threads)} past thread(s).")
+        while True:
+            ans = input("  Do you want to run any past thread? (y/n): ").strip().lower()
+            if ans in ("y", "yes", "n", "no"):
+                break
+            print("  Please enter 'y' or 'n'.")
+
+        if ans in ("y", "yes"):
+            print(f"\n  Available past threads:\n")
+            for i, t in enumerate(threads, 1):
+                ips_count = t["ips"]
+                print(f"    [{i}] IPs: {ips_count}")
+                print(f"        Thread: {t['thread_id']}")
+                print(f"        Status: [{t['status']}] | CVEs: {t['cves']}\n")
+
+            while True:
+                choice = input(f"  Select a thread to run (1-{len(threads)}, or 0 to start a new run): ").strip()
+                if choice == "0":
+                    break
+                if choice.isdigit() and 1 <= int(choice) <= len(threads):
+                    chosen_thread = threads[int(choice) - 1]
+                    break
+                print(f"  Invalid choice. Enter 1 to {len(threads)} (or 0 for new run).")
+
+            if chosen_thread:
+                tid = chosen_thread["thread_id"]
+                if chosen_thread["status"] == "complete":
+                    print(f"\n  [*] Thread '{tid}' already completed.")
+                    state = get_engine_status(tid)
+                    print(f"  Target IPs ({len(state.get('ips', []))}): {state.get('ips', [])}")
+                    print(f"  Extracted CVEs ({len(state.get('cve', []))}): {state.get('cve', [])}")
+                    return
+                print(f"\n  [*] Resuming past thread: {tid}")
+                run_engine([], thread_id=tid)
+                return
+
+    print(f"\n{'─' * 60}")
+    print("  NEW IP SCAN RUN")
+    print(f"{'─' * 60}")
+    raw = input("\n  Enter IP addresses (space or comma separated):\n  > ").strip()
+    if not raw:
+        print("[-] No IPs provided. Exiting.")
         sys.exit(1)
 
-    target_ips = sys.argv[1:]
+    target_ips = [ip.strip() for ip in raw.replace(",", " ").split()
+                  if ip.strip()]
 
-    thread_input = input("  Thread ID (leave blank for auto): ").strip()
-    thread_id = thread_input if thread_input else None
-
-    result = run_engine(target_ips, thread_id=thread_id)
-
-    print(f"\n\nFinal Status: {result.get('status_message')}")
+    run_engine(target_ips)
 
 
 if __name__ == "__main__":

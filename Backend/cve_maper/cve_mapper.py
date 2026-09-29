@@ -633,7 +633,7 @@ class ChatGPTSession:
                 # Small prompt — single paste
                 page.evaluate("text => navigator.clipboard.writeText(text)", prompt)
                 page.keyboard.press("Control+v")
-                page.wait_for_timeout(300)
+                page.wait_for_timeout(500)
             else:
                 # Large prompt — paste in chunks to avoid file-attachment
                 chunks = [prompt[i:i + CHUNK_SIZE]
@@ -643,22 +643,26 @@ class ChatGPTSession:
                         "text => navigator.clipboard.writeText(text)", chunk
                     )
                     page.keyboard.press("Control+v")
-                    page.wait_for_timeout(200)  # brief pause between chunks
+                    page.wait_for_timeout(300)  # brief pause between chunks
                 print(f"    [ChatGPT] Pasted in {len(chunks)} chunks.")
 
+            # Give the UI a moment to enable the send button after pasting
+            page.wait_for_timeout(1000)
+
             # ── Click Send ───────────────────────────────────────────────
-            # First check if send button is disabled (= message limit reached)
+            # Check if send button is disabled (= message limit reached)
             try:
                 send_btn = page.locator(_SEND_BUTTON_SELECTOR).first
                 if send_btn.count() > 0:
                     is_disabled = send_btn.get_attribute("disabled") is not None
                     aria_disabled = send_btn.get_attribute("aria-disabled")
+                    
                     if is_disabled or aria_disabled == "true":
                         print(f"    [ChatGPT] Send button is DISABLED "
                               f"— message limit reached!")
                         return "RATE_LIMITED"
             except Exception:
-                pass  # if check fails, proceed to try clicking anyway
+                pass
 
             try:
                 page.click(_SEND_BUTTON_SELECTOR, timeout=3000, force=True)
@@ -666,7 +670,6 @@ class ChatGPTSession:
             except Exception:
                 if _detect_rate_limit(page):
                     return "RATE_LIMITED"
-                # Double-check: button might be disabled without rate-limit text
                 try:
                     btn = page.locator(_SEND_BUTTON_SELECTOR).first
                     if btn.count() > 0 and btn.get_attribute("disabled") is not None:
@@ -690,186 +693,106 @@ class ChatGPTSession:
 
     def _wait_for_new_response(self, prev_count: int) -> str:
         """
-        Wait for a NEW assistant message and for it to stabilise.
-        Uses the stop-generating button appear/disappear strategy with
-        robust fallbacks for large prompts.
-
-        After stabilisation, verifies JSON completeness — if the response
-        looks like truncated JSON (no closing `}`), continues polling.
+        Wait for a NEW assistant message and for it to fully complete.
+        Uses a robust polling strategy to ensure the JSON is fully parsed.
         """
         page = self._page
+        print(f"    [ChatGPT] Waiting for response to complete (prev msgs: {prev_count})...")
 
-        print(f"    [ChatGPT] Waiting for response (prev msgs: {prev_count})...")
-
-        # Step 1: Wait for stop-generating button to APPEAR
-        # (confirms ChatGPT has started generating)
-        stop_appeared = False
-        try:
-            page.wait_for_selector(
-                _STOP_BUTTON_SELECTOR,
-                state="visible",
-                timeout=15000,
-            )
-            stop_appeared = True
-            print(f"    [ChatGPT] Streaming started...")
-        except Exception:
-            print(f"    [ChatGPT] Stop button didn't appear, checking directly...")
-
-        # Step 2: Wait for stop-generating button to DISAPPEAR
-        if stop_appeared:
-            # Button was visible → wait for it to go hidden (generation done)
-            try:
-                page.wait_for_selector(
-                    _STOP_BUTTON_SELECTOR,
-                    state="hidden",
-                    timeout=RESPONSE_TIMEOUT * 1000,
-                )
-                print(f"    [ChatGPT] Streaming finished!")
-            except Exception:
-                print(f"    [ChatGPT] Stop button still visible after "
-                      f"{RESPONSE_TIMEOUT}s, extracting anyway...")
-        else:
-            # Button NEVER appeared — don't check "hidden" (it returns immediately!)
-            # Instead, poll for assistant response to show up.
-            print(f"    [ChatGPT] Polling for response (stop button was absent)...")
-            poll_deadline = time.time() + 90  # wait up to 90s for large prompts
-            found_response = False
-            while time.time() < poll_deadline:
-                elements = page.query_selector_all(_ASSISTANT_SELECTOR)
-                if elements and len(elements) > prev_count:
-                    msg_text = elements[-1].inner_text().strip()
-                    if (msg_text.lower() not in _PLACEHOLDER_TEXTS
-                            and len(msg_text) > 50):
-                        found_response = True
-                        print(f"    [ChatGPT] Response appeared "
-                              f"({len(msg_text)} chars)")
-                        break
-                # Also check if stop button appeared late
-                try:
-                    stop_loc = page.locator(_STOP_BUTTON_SELECTOR)
-                    if stop_loc.count() > 0 and stop_loc.first.is_visible():
-                        print(f"    [ChatGPT] Stop button appeared late, "
-                              f"waiting for it to disappear...")
-                        page.wait_for_selector(
-                            _STOP_BUTTON_SELECTOR,
-                            state="hidden",
-                            timeout=RESPONSE_TIMEOUT * 1000,
-                        )
-                        print(f"    [ChatGPT] Streaming finished!")
-                        found_response = True
-                        break
-                except Exception:
-                    pass
-                time.sleep(2)
-
-            if not found_response:
-                # Last check for any response
-                elements = page.query_selector_all(_ASSISTANT_SELECTOR)
-                if not elements or len(elements) <= prev_count:
-                    if _detect_rate_limit(page):
-                        return "RATE_LIMITED"
-                    print(f"    [ChatGPT] No assistant response found "
-                          f"after 90s polling!")
-                    return None
-
-        # Step 3: Stabilization poll — wait for text to stop changing
-        # After stop button disappears, ChatGPT may still be rendering.
-        # Poll until text is stable for _STABLE_CHECKS consecutive checks.
-        previous_text = ""
-        stable_count = 0
-        deadline = time.time() + 60  # 60 seconds for stabilization
-
+        # Step 1: Wait for response element to appear
+        deadline = time.time() + 90
+        found = False
         while time.time() < deadline:
             elements = page.query_selector_all(_ASSISTANT_SELECTOR)
-            if not elements or len(elements) <= prev_count:
-                time.sleep(_POLL_INTERVAL)
-                continue
+            if elements and len(elements) > prev_count:
+                found = True
+                print(f"    [ChatGPT] Response element appeared...")
+                break
+            time.sleep(1)
 
-            current_text = elements[-1].inner_text().strip()
-
-            # Ignore placeholder texts (thinking, searching, etc.)
-            if current_text.lower() in _PLACEHOLDER_TEXTS or len(current_text) < 50:
-                time.sleep(_POLL_INTERVAL)
-                stable_count = 0
-                previous_text = ""
-                continue
-
-            if current_text == previous_text:
-                stable_count += 1
-                if stable_count >= _STABLE_CHECKS:  # stable for 5s (5 × 1.0s)
-                    print(f"    [ChatGPT] Response stabilised "
-                          f"({len(current_text)} chars, "
-                          f"{stable_count * _POLL_INTERVAL:.1f}s stable)")
-                    break
-            else:
-                stable_count = 0
-
-            previous_text = current_text
-            time.sleep(_POLL_INTERVAL)
-
-        # Step 4: JSON completeness check
-        # If response looks like JSON but doesn't end with }, keep polling
-        # (ChatGPT may have paused mid-generation)
-        final_text = self._extract_response_text(prev_count)
-        if final_text and _looks_like_json(final_text) and not _json_looks_complete(final_text):
-            print(f"    [ChatGPT] JSON looks incomplete "
-                  f"({len(final_text)} chars, ends: '{final_text[-40:]}'). "
-                  f"Polling for completion...")
-            json_deadline = time.time() + 60  # extra 60s for JSON completion
-            prev_len = len(final_text)
-            json_stable = 0
-            while time.time() < json_deadline:
-                time.sleep(2)
-                check_text = self._extract_response_text(prev_count)
-                if not check_text:
-                    continue
-
-                # Check if stop button reappeared (ChatGPT continued)
-                try:
-                    stop_loc = page.locator(_STOP_BUTTON_SELECTOR)
-                    if stop_loc.count() > 0 and stop_loc.first.is_visible():
-                        print(f"    [ChatGPT] Generation resumed, waiting...")
-                        page.wait_for_selector(
-                            _STOP_BUTTON_SELECTOR,
-                            state="hidden",
-                            timeout=RESPONSE_TIMEOUT * 1000,
-                        )
-                        json_stable = 0
-                        continue
-                except Exception:
-                    pass
-
-                if _json_looks_complete(check_text):
-                    print(f"    [ChatGPT] JSON now complete "
-                          f"({len(check_text)} chars)")
-                    final_text = check_text
-                    break
-
-                if len(check_text) == prev_len:
-                    json_stable += 1
-                    if json_stable >= 3:  # 6s stable but still incomplete
-                        print(f"    [ChatGPT] JSON still incomplete after 6s "
-                              f"stable. Extracting what we have.")
-                        final_text = check_text
-                        break
-                else:
-                    json_stable = 0
-                    prev_len = len(check_text)
-                    final_text = check_text
-
-        if not final_text:
+        if not found:
             if _detect_rate_limit(page):
                 return "RATE_LIMITED"
-            print(f"    [ChatGPT] No assistant response found!")
+            print(f"    [ChatGPT] No response appeared after 90s!")
+            return None
+
+        # Step 2: Poll until generation stops AND JSON is complete
+        # We consider it done when text stops changing for a while, and it looks like complete JSON.
+        max_time = time.time() + 180  # Max 3 minutes generation
+        stable_count = 0
+        prev_len = 0
+        final_text = ""
+
+        while time.time() < max_time:
+            time.sleep(2)
+            current_text = self._extract_response_text(prev_count)
+            
+            if not current_text:
+                continue
+                
+            # If text length is same as before, increment stability counter
+            if len(current_text) == prev_len:
+                stable_count += 1
+            else:
+                stable_count = 0
+                prev_len = len(current_text)
+
+            # Check if there is a "Continue generating" button
+            try:
+                # ChatGPT sometimes pauses on long outputs
+                continue_btn = page.locator("button:has-text('Continue generating')")
+                if continue_btn.count() > 0 and continue_btn.first.is_visible():
+                    print(f"    [ChatGPT] Clicking 'Continue generating'...")
+                    continue_btn.first.click()
+                    stable_count = 0
+                    time.sleep(2)
+                    continue
+            except Exception:
+                pass
+                
+            # Check if stop generating button is gone
+            is_generating = False
+            try:
+                stop_btn = page.locator(_STOP_BUTTON_SELECTOR).first
+                is_generating = stop_btn.count() > 0 and stop_btn.is_visible()
+            except Exception:
+                pass
+
+            # Condition for being done:
+            # Not explicitly generating, AND text is stable for 4 seconds (2 loops)
+            if not is_generating and stable_count >= 2:
+                # If it looks like JSON, make sure it's complete
+                if _looks_like_json(current_text):
+                    if _json_looks_complete(current_text):
+                        print(f"    [ChatGPT] JSON response complete ({len(current_text)} chars)")
+                        final_text = current_text
+                        break
+                    else:
+                        # Sometimes the text takes longer to render fully into the DOM
+                        if stable_count >= 6:  # 12 seconds stable but still incomplete JSON
+                            print(f"    [ChatGPT] Response stalled incomplete. Extracting as is.")
+                            final_text = current_text
+                            break
+                        elif stable_count % 3 == 0:
+                            print(f"    [ChatGPT] Waiting for JSON to complete... (len: {len(current_text)})")
+                else:
+                    # Non-JSON response, just return it
+                    print(f"    [ChatGPT] Non-JSON response stable ({len(current_text)} chars)")
+                    final_text = current_text
+                    break
+
+        if not final_text:
+            final_text = self._extract_response_text(prev_count)
+
+        if not final_text:
             return None
 
         # Safety check — if still a placeholder, something went wrong
         if final_text.lower() in _PLACEHOLDER_TEXTS or len(final_text) < 50:
-            print(f"    [ChatGPT] Response too short ({len(final_text)} chars), "
-                  f"likely a placeholder.")
+            print(f"    [ChatGPT] Response too short ({len(final_text)} chars), likely a placeholder.")
             return None
 
-        print(f"    [ChatGPT] Got response ({len(final_text)} chars)")
+        print(f"    [ChatGPT] Finished capturing response ({len(final_text)} chars)")
         return final_text
 
     def _extract_response_text(self, prev_count: int) -> str:
@@ -1115,42 +1038,52 @@ class AccountRotator:
 # Main Pipeline
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_pipeline(cve_list: list):
+# ═════════════════════════════════════════════════════════════════════════════
+# Generator Functions
+# ═════════════════════════════════════════════════════════════════════════════
+
+def fetch_nvd_gen(cve_list: list):
     """
-    Main CVE mapping pipeline:
-    1. Fetch NVD data for each CVE
-    2. Enrich with ChatGPT (MITRE mapping + walkthrough)
-    3. Save everything to database
+    Generator for NVD data fetching phase.
+
+    Yields progress dicts after each CVE is processed:
+        {
+            "nvd_data_fetcher": "running" | "completed",
+            "nvd_data_fetcher_done": "n/m",
+            "nvd_results": {cve_id: parsed_data, ...},
+        }
+
+    The last yielded dict contains the final nvd_results.
+
+    Args:
+        cve_list: List of CVE ID strings.
     """
+    if not cve_list:
+        yield {
+            "nvd_data_fetcher": "completed",
+            "nvd_data_fetcher_done": "0/0",
+            "nvd_results": {},
+        }
+        return
 
-    # ── Validate accounts ────────────────────────────────────────────────
-    accounts = _load_accounts()
-    if not accounts:
-        print("\n[!] No ChatGPT accounts found.")
-        print("    Run 'python add_chatgpt_account.py' first to register accounts.")
-        sys.exit(1)
+    total = len(cve_list)
+    yield {
+        "nvd_data_fetcher": "running",
+        "nvd_data_fetcher_done": f"0/{total}",
+        "nvd_results": {},
+    }
 
-    print(f"\n{'=' * 60}")
-    print(f"  CVE Mapper Pipeline")
-    print(f"{'=' * 60}")
-    print(f"  CVEs to process:  {len(cve_list)}")
-    print(f"  Accounts:         {len(accounts)}")
-    print(f"  NVD API key:      {'configured' if NVD_API_KEY else 'NOT SET (slower)'}")
-    print(f"{'=' * 60}\n")
-
-    # ── Connect to database ──────────────────────────────────────────────
     db = DBManager()
     db.init_tables()
+    nvd_results = {}
 
-    # ── Phase 1: Fetch all NVD data first ────────────────────────────────
     print(f"\n{'─' * 60}")
     print(f"  Phase 1: Fetching NVD Data")
     print(f"{'─' * 60}")
 
-    nvd_results = {}  # cve_id -> nvd_parsed
     for i, cve_id in enumerate(cve_list, 1):
         cve_id = cve_id.strip().upper()
-        print(f"\n  [{i}/{len(cve_list)}] {cve_id}")
+        print(f"\n  [{i}/{total}] {cve_id}")
 
         # Check if already in DB
         if db.check_cve_exists(cve_id):
@@ -1158,6 +1091,11 @@ def run_pipeline(cve_list: list):
             existing = db.get_cve_detail(cve_id)
             if existing:
                 nvd_results[cve_id] = existing
+                yield {
+                    "nvd_data_fetcher": "running",
+                    "nvd_data_fetcher_done": f"{i}/{total}",
+                    "nvd_results": nvd_results,
+                }
                 continue
 
         # Fetch from NVD
@@ -1168,38 +1106,73 @@ def run_pipeline(cve_list: list):
         else:
             print(f"  [!] Could not fetch NVD data for {cve_id}, skipping.")
 
-        # Rate limiting is handled inside fetch_nvd_data() by NVDRateLimiter
+        yield {
+            "nvd_data_fetcher": "running",
+            "nvd_data_fetcher_done": f"{i}/{total}",
+            "nvd_results": nvd_results,
+        }
 
-    print(f"\n  NVD: {len(nvd_results)}/{len(cve_list)} CVEs fetched successfully.")
+    print(f"\n  NVD: {len(nvd_results)}/{total} CVEs fetched successfully.")
+    db.close()
 
-    if not nvd_results:
-        print("\n[!] No NVD data fetched. Nothing to enrich.")
-        db.close()
+    yield {
+        "nvd_data_fetcher": "completed",
+        "nvd_data_fetcher_done": f"{total}/{total}",
+        "nvd_results": nvd_results,
+    }
+
+
+def enrich_gpt_gen(cve_list: list, nvd_results: dict):
+    """
+    Generator for ChatGPT enrichment phase.
+
+    Yields progress dicts after each CVE is processed:
+        {
+            "cve_mapper_gpt": "running" | "completed",
+            "cve_mapper_gpt_done": "n/m",
+        }
+
+    All data goes directly to the database.
+
+    Args:
+        cve_list: List of CVE IDs needing GPT analysis.
+        nvd_results: Dict of {cve_id: nvd_data} from fetch_nvd_gen.
+    """
+    if not cve_list:
+        yield {
+            "cve_mapper_gpt": "completed",
+            "cve_mapper_gpt_done": "0/0",
+        }
         return
 
-    # ── Phase 2: ChatGPT Enrichment ──────────────────────────────────────
+    # ── Validate accounts ────────────────────────────────────────────────
+    accounts = _load_accounts()
+    if not accounts:
+        print("\n[!] No ChatGPT accounts found.")
+        print("    Run 'python add_chatgpt_account.py' first to register accounts.")
+        yield {
+            "cve_mapper_gpt": "completed",
+            "cve_mapper_gpt_done": f"0/{len(cve_list)}",
+        }
+        return
+
+    total = len(cve_list)
+    yield {
+        "cve_mapper_gpt": "running",
+        "cve_mapper_gpt_done": f"0/{total}",
+    }
+
     print(f"\n{'─' * 60}")
     print(f"  Phase 2: ChatGPT Enrichment")
     print(f"{'─' * 60}")
+    print(f"\n  CVEs needing ChatGPT analysis: {total}")
 
-    # Filter out CVEs that already have analysis
-    cves_needing_analysis = []
-    for cve_id in nvd_results:
-        if db.check_cve_analysis_exists(cve_id):
-            print(f"  [=] {cve_id}: Analysis already exists, skipping.")
-        else:
-            cves_needing_analysis.append(cve_id)
-
-    if not cves_needing_analysis:
-        print("\n  All CVEs already have ChatGPT analysis. Nothing to do.")
-        db.close()
-        return
-
-    print(f"\n  CVEs needing ChatGPT analysis: {len(cves_needing_analysis)}")
+    db = DBManager()
+    db.init_tables()
 
     # Set up account rotation
     rotator = AccountRotator(accounts)
-    retry_queue = []  # CVEs that failed JSON parsing
+    retry_queue = []
     completed = 0
     failed = 0
 
@@ -1214,13 +1187,25 @@ def run_pipeline(cve_list: list):
                 print("\n[!] All accounts failed to login. Exiting.")
                 session.close()
                 db.close()
+                yield {
+                    "cve_mapper_gpt": "completed",
+                    "cve_mapper_gpt_done": f"0/{total}",
+                }
                 return
 
         # Process each CVE
-        for i, cve_id in enumerate(cves_needing_analysis, 1):
-            print(f"\n  [{i}/{len(cves_needing_analysis)}] {cve_id}  ({rotator.status()})")
+        for i, cve_id in enumerate(cve_list, 1):
+            print(f"\n  [{i}/{total}] {cve_id}  ({rotator.status()})")
 
-            nvd_data = nvd_results[cve_id]
+            nvd_data = nvd_results.get(cve_id)
+            if not nvd_data:
+                retry_queue.append(cve_id)
+                yield {
+                    "cve_mapper_gpt": "running",
+                    "cve_mapper_gpt_done": f"{i}/{total}",
+                }
+                continue
+
             prompt = build_chatgpt_prompt(cve_id, nvd_data)
 
             # Send to ChatGPT
@@ -1233,6 +1218,10 @@ def run_pipeline(cve_list: list):
                 if not _try_next_account(session, rotator):
                     print("\n[!] All accounts exhausted. Stopping.")
                     retry_queue.append(cve_id)
+                    yield {
+                        "cve_mapper_gpt": "running",
+                        "cve_mapper_gpt_done": f"{i}/{total}",
+                    }
                     break
 
                 # Retry this CVE with the new account
@@ -1240,11 +1229,19 @@ def run_pipeline(cve_list: list):
                 if session.is_rate_limited(response):
                     print(f"    [!] Still rate limited. Adding to retry queue.")
                     retry_queue.append(cve_id)
+                    yield {
+                        "cve_mapper_gpt": "running",
+                        "cve_mapper_gpt_done": f"{i}/{total}",
+                    }
                     continue
 
             if not response or response == "RATE_LIMITED":
                 print(f"    [!] No response received. Adding to retry queue.")
                 retry_queue.append(cve_id)
+                yield {
+                    "cve_mapper_gpt": "running",
+                    "cve_mapper_gpt_done": f"{i}/{total}",
+                }
                 continue
 
             # Parse response
@@ -1258,8 +1255,6 @@ def run_pipeline(cve_list: list):
                 print(f"    [+] Saved: {mitre_count} MITRE mappings, "
                       f"{walk_count} walkthrough steps")
             elif parsed:
-                # Parsed as JSON but failed validation — save anyway
-                # (partial data is better than nothing)
                 print(f"    [~] Response parsed but incomplete. "
                       f"Keys: {list(parsed.keys())}")
                 db.save_cve_analysis(cve_id, parsed)
@@ -1268,7 +1263,6 @@ def run_pipeline(cve_list: list):
             else:
                 print(f"    [!] Failed to parse JSON response.")
                 print(f"    [!] Response starts with: {response[:150]}")
-                # Save raw response for debugging in error_json/ folder
                 ERROR_JSON_DIR.mkdir(exist_ok=True)
                 debug_file = ERROR_JSON_DIR / f"debug_{cve_id}.txt"
                 with open(debug_file, "w", encoding="utf-8") as f:
@@ -1276,6 +1270,11 @@ def run_pipeline(cve_list: list):
                 print(f"    [!] Raw response saved to: error_json/{debug_file.name}")
                 retry_queue.append(cve_id)
                 failed += 1
+
+            yield {
+                "cve_mapper_gpt": "running",
+                "cve_mapper_gpt_done": f"{i}/{total}",
+            }
 
         # ── Retry queue ──────────────────────────────────────────────────
         if retry_queue and not rotator.is_exhausted():
@@ -1310,19 +1309,15 @@ def run_pipeline(cve_list: list):
                         db.save_cve_analysis(cve_id, parsed)
                         completed += 1
                         print(f"    [+] Retry succeeded!")
-                        # Delete debug file on successful retry
                         _cleanup_debug_file(cve_id)
                     elif parsed:
-                        # Partial data — save anyway
                         db.save_cve_analysis(cve_id, parsed)
                         completed += 1
                         print(f"    [~] Retry partial save (keys: {list(parsed.keys())})")
-                        # Delete debug file since we got usable data
                         _cleanup_debug_file(cve_id)
                     else:
                         still_failed.append(cve_id)
                         print(f"    [!] Retry failed (bad JSON).")
-                        # Save new debug file for this retry attempt
                         ERROR_JSON_DIR.mkdir(exist_ok=True)
                         debug_file = ERROR_JSON_DIR / f"debug_{cve_id}.txt"
                         with open(debug_file, "w", encoding="utf-8") as f:
@@ -1336,21 +1331,71 @@ def run_pipeline(cve_list: list):
         session.close()
 
     # ── Summary ──────────────────────────────────────────────────────────
+    print(f"\n  GPT Enrichment: {completed} completed, {len(retry_queue)} failed")
+    if retry_queue:
+        print(f"  Failed CVEs: {', '.join(retry_queue)}")
+
+    db.close()
+
+    yield {
+        "cve_mapper_gpt": "completed",
+        "cve_mapper_gpt_done": f"{total}/{total}",
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Pipeline (uses both generators)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_pipeline(cve_list: list):
+    """
+    Main CVE mapping pipeline:
+    1. Fetch NVD data for each CVE (via fetch_nvd_gen)
+    2. Enrich with ChatGPT (via enrich_gpt_gen)
+    3. Save everything to database
+
+    Internally consumes both generators for progress tracking.
+    """
+    print(f"\n{'=' * 60}")
+    print(f"  CVE Mapper Pipeline")
+    print(f"{'=' * 60}")
+    print(f"  CVEs to process:  {len(cve_list)}")
+    print(f"  NVD API key:      {'configured' if NVD_API_KEY else 'NOT SET (slower)'}")
+    print(f"{'=' * 60}\n")
+
+    # Phase 1: NVD fetch
+    nvd_progress = None
+    for nvd_progress in fetch_nvd_gen(cve_list):
+        pass
+    nvd_results = nvd_progress.get("nvd_results", {}) if nvd_progress else {}
+
+    if not nvd_results:
+        print("\n[!] No NVD data fetched. Nothing to enrich.")
+        return
+
+    # Filter out CVEs that already have analysis
+    db = DBManager()
+    db.init_tables()
+    cves_needing_analysis = []
+    for cve_id in nvd_results:
+        if db.check_cve_analysis_exists(cve_id):
+            print(f"  [=] {cve_id}: Analysis already exists, skipping.")
+        else:
+            cves_needing_analysis.append(cve_id)
+    db.close()
+
+    if not cves_needing_analysis:
+        print("\n  All CVEs already have ChatGPT analysis. Nothing to do.")
+        return
+
+    # Phase 2: GPT enrichment
+    for gpt_progress in enrich_gpt_gen(cves_needing_analysis, nvd_results):
+        pass
+
+    # Final summary
     print(f"\n{'=' * 60}")
     print(f"  CVE Mapper — Complete")
     print(f"{'=' * 60}")
-    print(f"  Total CVEs:     {len(cve_list)}")
-    print(f"  NVD fetched:    {len(nvd_results)}")
-    print(f"  Analyzed:       {completed}")
-    print(f"  Failed/Skipped: {len(retry_queue)}")
-    if retry_queue:
-        print(f"\n  Failed CVEs:")
-        for cve_id in retry_queue:
-            print(f"    - {cve_id}")
-        print(f"\n  To retry: python cve_mapper.py {','.join(retry_queue)}")
-    print(f"{'=' * 60}")
-
-    db.close()
 
 
 def _cleanup_debug_file(cve_id: str):
@@ -1403,7 +1448,6 @@ def main():
             sys.exit(1)
 
     # Parse CVE list — support both comma and space separators
-    # Replace commas with spaces, then split on whitespace
     cve_list = [c.strip() for c in raw.replace(",", " ").split() if c.strip()]
 
     if not cve_list:
@@ -1434,3 +1478,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

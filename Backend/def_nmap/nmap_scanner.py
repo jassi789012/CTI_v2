@@ -43,7 +43,7 @@ DEFAULT_SCAN_ARGS = (
     "-O "                      # OS detection
     "--script default,vuln,ssl-enum-ciphers,http-title,http-headers,banner "
     "-T4 "                     # Aggressive timing
-    "-p- "        # Top 1000 ports
+    "-p- "        
     "--open "                  # Only show open ports
     "--reason"                 # Show reason port is open
 )
@@ -261,35 +261,48 @@ def _extract_cves(script_id: str, output: str) -> list:
 # Main: Scan IPs and Save to Database
 # ═════════════════════════════════════════════════════════════════════════════
 
-def nmap_scan_ips(
+# ═════════════════════════════════════════════════════════════════════════════
+# Generator Function
+# ═════════════════════════════════════════════════════════════════════════════
+
+def nmap_scan_ips_gen(
     ips: list,
     scan_args: str = None,
-    skip_db: bool = False,
     workers: int = 5,
-) -> list:
+):
     """
-    Scan a list of IPs with Nmap and store results in PostgreSQL.
+    Generator that scans a list of IPs with Nmap and stores results in PostgreSQL.
+
+    Yields progress dicts as each IP scan completes:
+        {
+            "ip_data_fetcher_nmap": "running" | "completed",
+            "ip_data_fetcher_nmap_done": "n/m",
+        }
+
+    Data goes directly to the database — not returned in the yields.
 
     Args:
         ips:         List of IP addresses to scan
         scan_args:   Custom Nmap arguments (default: comprehensive scan)
-        skip_db:     If True, return parsed data without saving to DB
         workers:     Number of parallel Nmap processes (default: 5)
-
-    Returns:
-        List of parsed host dictionaries
     """
     if not ips:
         print("[-] No IPs provided.")
-        return []
+        yield {
+            "ip_data_fetcher_nmap": "completed",
+            "ip_data_fetcher_nmap_done": "0/0",
+        }
+        return
 
     args = scan_args or DEFAULT_SCAN_ARGS
     unique_ips = list(dict.fromkeys(ips))
-    num_workers = min(workers, len(unique_ips))
+    total = len(unique_ips)
+    num_workers = min(workers, total)
 
-    print(f"\n{'='*70}")
-    print(f"  Nmap Scanner — {len(unique_ips)} target(s), {num_workers} workers")
-    print(f"{'='*70}")
+    yield {
+        "ip_data_fetcher_nmap": "running",
+        "ip_data_fetcher_nmap_done": f"0/{total}",
+    }
 
     # Verify nmap is installed
     try:
@@ -297,26 +310,33 @@ def nmap_scan_ips(
     except nmap.PortScannerError as e:
         print(f"[-] Nmap not found: {e}")
         print("    Install from: https://nmap.org/download.html")
-        return []
+        yield {
+            "ip_data_fetcher_nmap": "completed",
+            "ip_data_fetcher_nmap_done": f"0/{total}",
+        }
+        return
+
+    print(f"\n{'='*70}")
+    print(f"  Nmap Scanner — {total} target(s), {num_workers} workers")
+    print(f"{'='*70}")
 
     # Connect to database
     db = None
     db_lock = threading.Lock()
-    if not skip_db:
-        try:
-            db = DBManager()
-            db.init_tables()
-        except Exception as e:
-            print(f"[-] Could not connect to database: {e}")
-            print("    Results will NOT be saved to PostgreSQL.")
+    try:
+        db = DBManager()
+        db.init_tables()
+    except Exception as e:
+        print(f"[-] Could not connect to database: {e}")
+        print("    Results will NOT be saved to PostgreSQL.")
 
     # ─── Worker function (runs per IP in its own thread) ─────────────────
-    def scan_single_ip(ip_index_tuple):
+    def _scan_worker(ip_index_tuple):
         i, ip = ip_index_tuple
         # Each thread gets its own scanner instance
         nm = nmap.PortScanner()
 
-        print(f"\n[{i}/{len(unique_ips)}] Scanning: {ip}")
+        print(f"\n[{i}/{total}] Scanning: {ip}")
 
         try:
             nm.scan(hosts=ip, arguments=args)
@@ -360,11 +380,22 @@ def nmap_scan_ips(
             print(f"    [-] Parse error for {host}: {e}")
             return {"ip": host, "error": str(e)}
 
-    # ─── Run workers ─────────────────────────────────────────────────────
+    # ─── Run workers and yield progress ──────────────────────────────────
     indexed_ips = list(enumerate(unique_ips, 1))
+    completed_count = 0
+    all_results = []
 
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        all_results = list(pool.map(scan_single_ip, indexed_ips))
+        from concurrent.futures import as_completed
+        futures = {pool.submit(_scan_worker, item): item for item in indexed_ips}
+        for future in as_completed(futures):
+            result = future.result()
+            all_results.append(result)
+            completed_count += 1
+            yield {
+                "ip_data_fetcher_nmap": "running",
+                "ip_data_fetcher_nmap_done": f"{completed_count}/{total}",
+            }
 
     # ─── Summary ─────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
@@ -382,7 +413,38 @@ def nmap_scan_ips(
     if db:
         db.close()
 
-    return all_results
+    yield {
+        "ip_data_fetcher_nmap": "completed",
+        "ip_data_fetcher_nmap_done": f"{total}/{total}",
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Synchronous Wrapper
+# ═════════════════════════════════════════════════════════════════════════════
+
+def nmap_scan_ips(
+    ips: list,
+    scan_args: str = None,
+    skip_db: bool = False,
+    workers: int = 5,
+) -> list:
+    """
+    Synchronous wrapper — scans IPs and returns results list.
+
+    Internally consumes nmap_scan_ips_gen() for progress tracking.
+
+    Args:
+        ips:         List of IP addresses to scan
+        scan_args:   Custom Nmap arguments (default: comprehensive scan)
+        skip_db:     If True, return parsed data without saving to DB
+        workers:     Number of parallel Nmap processes (default: 5)
+
+    Returns:
+        List of parsed host dictionaries
+    """
+    for progress in nmap_scan_ips_gen(ips, scan_args, workers):
+        pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -468,13 +530,11 @@ if __name__ == "__main__":
         sys.exit(1)
 
     target_ips = sys.argv[1:]
-    results = nmap_scan_ips(target_ips)
 
-    for r in results:
-        if "error" in r:
-            print(f"  {r['ip']}: ERROR — {r['error']}")
-        else:
-            ports = r.get("open_ports", [])
-            os_name = r.get("general_info", {}).get("OS") or "Unknown"
-            print(f"  {r['ip']}: {len(ports)} ports, OS: {os_name}")
+    progress = None
+    for progress in nmap_scan_ips_gen(target_ips):
+        status = progress["ip_data_fetcher_nmap"]
+        done = progress["ip_data_fetcher_nmap_done"]
+        print(f"  [{status}] {done}")
 
+    print("\nScan complete.")
