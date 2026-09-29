@@ -44,17 +44,14 @@ CTI_V2/
 ├── uv.lock                       # Locked dependency versions
 │
 ├── Backend/
+│   ├── Engine_query_input.py     # Main LangGraph engine (Query → IPs → Scans → CVEs)
+│   ├── Engine_ip_input.py        # LangGraph engine (Direct IPs → Scans → CVEs)
 │   ├── db_manager.py             # PostgreSQL database manager (schema, CRUD)
 │   │
-│   ├── def_Shodan/               # Shodan scraping module
-│   │   ├── get_ip.py             # Scrapes IPs from Shodan search results
-│   │   ├── get_ip_info.py        # Scrapes detailed host info for each IP
-│   │   ├── try.py                # Example runner script
-│   │   └── shodan_cookies.json   # Cached Shodan session cookies (auto-generated)
-│   │
-│   ├── def_nmap/                 # Nmap integration (planned)
-│   ├── cve_maper/                # CVE mapping module (planned)
-│   └── query_gen/                # Query generation module (planned)
+│   ├── def_Shodan/               # Shodan scraping module (get_ip, get_ip_info)
+│   ├── def_nmap/                 # Nmap concurrent scanning module
+│   ├── cve_maper/                # CVE mapping (NVD + ChatGPT automation)
+│   └── query_gen/                # AI-powered query generation (Groq API)
 │
 └── src/                          # Future: frontend / API layer
 ```
@@ -65,38 +62,40 @@ CTI_V2/
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                       try.py (Runner)                    │
-│         Defines queries → calls get_ip → get_ip_info     │
+│                   Engine_query_input.py                  │
+│       LangGraph StateGraph for full query pipeline       │
 └──────────┬──────────────────────────────┬────────────────┘
            │                              │
            ▼                              ▼
 ┌─────────────────────┐      ┌─────────────────────────────┐
-│     get_ip.py       │      │      get_ip_info.py         │
+│    query_gen_ai     │      │         get_ip              │
 │                     │      │                             │
-│ • Logs into Shodan  │      │ • Visits each IP's host page│
-│   via Playwright    │      │ • Parses HTML → structured  │
-│ • Runs search       │      │   JSON (ports, CVEs, tech)  │
-│   queries           │      │ • Saves to PostgreSQL via   │
-│ • Extracts IPs from │      │   DBManager                 │
-│   search results    │      │                             │
+│ • Groq LLM          │ ───→ │ • Logs into Shodan via      │
+│ • Natural language  │      │   Playwright                │
+│   to Shodan queries │      │ • Extracts target IPs       │
 └─────────────────────┘      └──────────────┬──────────────┘
                                             │
                                             ▼
                              ┌──────────────────────────────┐
-                             │       db_manager.py          │
-                             │                              │
-                             │ • Manages PostgreSQL conn    │
-                             │ • Creates tables on startup  │
-                             │ • Inserts structured data    │
-                             │   across 5 normalized tables │
+                             │       process_all_ips        │
+                             │   (Concurrent Execution)     │
+                             │ ├── Shodan (get_ip_info)     │
+                             │ └── Nmap (nmap_scanner)      │
+                             └──────────────┬───────────────┘
+                                            │
+                                            ▼
+                             ┌──────────────────────────────┐
+                             │         cve_mapper           │
+                             │ ├── NVD API Enrichment       │
+                             │ └── ChatGPT Vulnerability    │
+                             │     Analysis & MITRE Mapping │
                              └──────────────┬───────────────┘
                                             │
                                             ▼
                              ┌──────────────────────────────┐
                              │     PostgreSQL (cti_db)      │
-                             │                              │
-                             │  hosts · scans · ports       │
-                             │  vulnerabilities · technologies│
+                             │   (9 normalized tables for   │
+                             │   hosts, scans, cves, etc.)  │
                              └──────────────────────────────┘
 ```
 
@@ -110,6 +109,8 @@ CTI_V2/
 | **uv**       | Latest   | Python package manager           |
 | **PostgreSQL**| ≥ 16    | Database                         |
 | **Playwright**| ≥ 1.63  | Browser automation (Shodan login)|
+| **Nmap**     | Latest   | Port scanning engine             |
+| **ChatGPT**  | Account  | Free account for LLM CVE Analysis|
 
 ---
 
@@ -188,6 +189,12 @@ PG_PORT=5432
 PG_DATABASE=cti_db
 PG_USER=postgres
 PG_PASSWORD=your_postgres_password
+
+# Groq API (for AI query generation)
+GROQ_API_KEY=your_groq_api_key_here
+
+# NIST NVD API (for CVE data enrichment)
+NIST_API_KEY=your_nist_api_key_here
 ```
 
 > **Important:** The `.env` file is listed in `.gitignore` and will **not** be pushed to Git.
@@ -196,35 +203,34 @@ PG_PASSWORD=your_postgres_password
 
 ## Usage
 
-### Quick Start
+### Quick Start (Query Engine)
 
-Navigate to the Shodan module directory and run:
+Run the full pipeline using the interactive CLI engine:
 
 ```bash
-cd Backend/def_Shodan
-python try.py
+cd Backend
+python Engine_query_input.py
 ```
 
 This will:
-1. Log into Shodan using your credentials
-2. Search for IPs matching the queries defined in `try.py`
-3. Visit each discovered IP's host page
-4. Parse the HTML and extract structured data
-5. Store everything in PostgreSQL (`cti_db`)
+1. Ask you if you want to run a past thread or start a new run.
+2. Prompt you for a natural language query (e.g. "Find apache servers in Germany").
+3. Use Groq AI to generate valid Shodan queries.
+4. Discover IPs via Shodan.
+5. Concurrently scan the IPs using Shodan and Nmap.
+6. Enrich extracted CVEs with NVD and ChatGPT analysis.
+7. Store everything in PostgreSQL (`cti_db`).
 
-### Customize Queries
+### Quick Start (Direct IPs)
 
-Edit [`try.py`](Backend/def_Shodan/try.py) to change the Shodan search queries:
+If you already have a list of target IPs and just want to scan them:
 
-```python
-queries = [
-    "apache country:DE",
-    "nginx port:443 country:US",
-    "product:OpenSSH port:22",
-    "has_vuln:true country:JP",
-    # Add your own queries here
-]
+```bash
+cd Backend
+python Engine_ip_input.py
 ```
+
+This will bypass query generation and go straight to scanning the IPs provided via CLI.
 
 ### Verify Database (Optional)
 
@@ -316,9 +322,10 @@ hosts (1) ──→ (N) scans (1) ──→ (N) ports (1) ──→ (N) vulnerab
 
 ## Future Roadmap
 
-- [ ] **Nmap Integration** — Scan IPs with Nmap and store results in the same database (`def_nmap/`)
-- [ ] **CVE Mapper** — Enrich vulnerability data with NVD/MITRE details (`cve_maper/`)
-- [ ] **Query Generator** — AI-powered Shodan/Nmap query generation (`query_gen/`)
+- [x] **Nmap Integration** — Scan IPs with Nmap and store results in the same database (`def_nmap/`)
+- [x] **CVE Mapper** — Enrich vulnerability data with NVD/MITRE details (`cve_maper/`)
+- [x] **Query Generator** — AI-powered Shodan/Nmap query generation (`query_gen/`)
+- [x] **LangGraph Engine** — Graph-based agent pipelines with PostgreSQL state persistence.
 - [ ] **AI Agent** — Connect an LLM agent to the database for natural language threat analysis
 - [ ] **Frontend Dashboard** — Web UI for visualizing collected intelligence (`src/`)
 - [ ] **API Layer** — REST API for programmatic access to CTI data
