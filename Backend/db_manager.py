@@ -534,6 +534,24 @@ class DBManager:
                 metadata["traceroute"] = parsed_data["traceroute"]
             if parsed_data.get("scan_info"):
                 metadata["scan_info"] = parsed_data["scan_info"]
+            if parsed_data.get("geolocation"):
+                metadata["geolocation"] = parsed_data["geolocation"]
+            if parsed_data.get("firewall_detection"):
+                metadata["firewall_detection"] = parsed_data["firewall_detection"]
+            if parsed_data.get("ssh_info"):
+                metadata["ssh_info"] = parsed_data["ssh_info"]
+            if parsed_data.get("dns_info"):
+                metadata["dns_info"] = parsed_data["dns_info"]
+            if parsed_data.get("scan_duration_seconds"):
+                metadata["scan_duration_seconds"] = parsed_data["scan_duration_seconds"]
+            if parsed_data.get("whois"):
+                metadata["whois"] = parsed_data["whois"]
+            if parsed_data.get("ip_protocols"):
+                metadata["ip_protocols"] = parsed_data["ip_protocols"]
+            if parsed_data.get("hostscripts"):
+                metadata["hostscripts"] = parsed_data["hostscripts"]
+            if parsed_data.get("smb_info"):
+                metadata["smb_info"] = parsed_data["smb_info"]
 
             hostnames = general_info.get("hostnames", [])
             if hostnames:

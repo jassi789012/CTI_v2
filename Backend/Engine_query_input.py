@@ -180,8 +180,9 @@ def extract_cves_node(state: EngineState) -> dict:
     for progress in extract_cves_gen(ips):
         status = progress.get("cve_extractor", "running")
         done = progress.get("cve_extractor_done", "0/0")
-        cves = progress.get("cve", cves)
+        cves = progress.get("cves", cves)
         print(f"\r[CVE Extractor] Status: {status} | Progress: {done} | CVEs: {len(cves)}", end="")
+    print()
     print()
         
     return {
