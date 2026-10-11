@@ -1031,6 +1031,13 @@ class ChatGPTSession:
         deadline = time.time() + 60
         found = False
         while time.time() < deadline:
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled():
+                    raise InterruptedError("Engine cancelled by user")
+            except ImportError:
+                pass
+
             elements = self._find_assistant_messages()
             if elements and len(elements) > prev_count:
                 found = True
@@ -1074,6 +1081,13 @@ class ChatGPTSession:
         poll_num = 0
 
         while time.time() < max_time:
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled():
+                    raise InterruptedError("Engine cancelled by user")
+            except ImportError:
+                pass
+
             time.sleep(2)
             poll_num += 1
 
@@ -1538,6 +1552,13 @@ def fetch_nvd_gen(cve_list: list):
     print(f"{'─' * 60}")
 
     for i, cve_id in enumerate(cve_list, 1):
+        try:
+            from engine_progress import is_cancelled
+            if is_cancelled():
+                raise InterruptedError("Engine cancelled by user")
+        except ImportError:
+            pass
+
         cve_id = cve_id.strip().upper()
         print(f"\n  [{i}/{total}] {cve_id}")
 
@@ -1651,6 +1672,13 @@ def enrich_gpt_gen(cve_list: list, nvd_results: dict):
 
         # Process each CVE
         for i, cve_id in enumerate(cve_list, 1):
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled():
+                    raise InterruptedError("Engine cancelled by user")
+            except ImportError:
+                pass
+
             print(f"\n  [{i}/{total}] {cve_id}  ({rotator.status()})")
 
             nvd_data = nvd_results.get(cve_id)

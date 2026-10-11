@@ -35,7 +35,7 @@ from nmap_scanner import nmap_scan_ips_gen
 from db_manager import DBManager
 from cve_extractor import extract_cves_gen
 from cve_mapper import fetch_nvd_gen, enrich_gpt_gen
-from engine_progress import emit_progress, is_cancelled
+from engine_progress import emit_progress, is_cancelled, get_context, set_context, clear_context
 
 # ─── Load .env ───────────────────────────────────────────────────────────────
 env_path = BACKEND_DIR.parent / ".env"
@@ -139,19 +139,48 @@ def process_all_ips_node(state: EngineState, config: RunnableConfig) -> dict:
         }
         
     q = queue.Queue()
+    ctx = get_context()
     
     def run_shodan():
-        for progress in get_ip_info_gen(ips):
-            q.put(progress)
-        q.put(None)
+        if ctx and ctx[0]:
+            try:
+                set_context(*ctx)
+            except Exception:
+                pass
+        try:
+            for progress in get_ip_info_gen(ips):
+                if is_cancelled(engine_thread_id=thread_id):
+                    break
+                q.put(progress)
+        except InterruptedError:
+            pass
+        except Exception as e:
+            print(f"\n[!] Shodan worker error: {e}")
+        finally:
+            q.put(None)
+            clear_context()
         
     def run_nmap():
-        for progress in nmap_scan_ips_gen(ips, engine_thread_id=thread_id):
-            q.put(progress)
-        q.put(None)
+        if ctx and ctx[0]:
+            try:
+                set_context(*ctx)
+            except Exception:
+                pass
+        try:
+            for progress in nmap_scan_ips_gen(ips, engine_thread_id=thread_id):
+                if is_cancelled(engine_thread_id=thread_id):
+                    break
+                q.put(progress)
+        except InterruptedError:
+            pass
+        except Exception as e:
+            print(f"\n[!] Nmap worker error: {e}")
+        finally:
+            q.put(None)
+            clear_context()
         
-    t1 = threading.Thread(target=run_shodan)
-    t2 = threading.Thread(target=run_nmap)
+    t1 = threading.Thread(target=run_shodan, daemon=True)
+    t2 = threading.Thread(target=run_nmap, daemon=True)
     t1.start()
     t2.start()
     
@@ -162,7 +191,7 @@ def process_all_ips_node(state: EngineState, config: RunnableConfig) -> dict:
     emit_progress("process_all_ips", "running", f"Shodan: 0/{len(ips)} | Nmap: 0/{len(ips)}")
     
     while finished_threads < 2:
-        if is_cancelled():
+        if is_cancelled(engine_thread_id=thread_id):
             raise InterruptedError("Engine cancelled by user")
             
         try:
@@ -186,8 +215,8 @@ def process_all_ips_node(state: EngineState, config: RunnableConfig) -> dict:
             emit_progress("process_all_ips", "running", f"Shodan: {final_shodan_done} | Nmap: {final_nmap_done}")
             print(f"\r[Shodan] {final_shodan_done} | [Nmap] {status} {final_nmap_done}", end="")
 
-    t1.join()
-    t2.join()
+    t1.join(timeout=3.0)
+    t2.join(timeout=3.0)
     print()
     
     emit_progress("process_all_ips", "done", f"{len(ips)}/{len(ips)} IPs scanned")

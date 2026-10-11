@@ -558,6 +558,14 @@ def get_ip_info_gen(ip_list):
 
     try:
         for idx, target_ip in enumerate(clean_ips, start=1):
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled():
+                    print(f"[*] Shodan scraper paused/cancelled by user.")
+                    break
+            except ImportError:
+                pass
+
             print(f"\n{'='*60}")
             print(f"[{idx}/{total}] Processing IP: {target_ip}")
             print(f"{'='*60}")

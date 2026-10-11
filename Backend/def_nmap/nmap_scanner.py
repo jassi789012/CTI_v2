@@ -819,7 +819,7 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
     def _check_cancel():
         try:
             from engine_progress import is_cancelled
-            if is_cancelled():
+            if is_cancelled(engine_thread_id=engine_thread_id):
                 raise InterruptedError("Engine cancelled by user")
         except ImportError:
             pass
@@ -840,6 +840,7 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
     try:
         # ── Phase 1: Fast TCP Port Discovery ─────────────────────────────
         if last_completed < 1:
+            _check_cancel()
             _update_ui(1, "TCP port discovery (all 65535 ports)")
             scanner = nmap.PortScanner()
             print(f"    [1/9] TCP port discovery (all 65535 ports)...")
@@ -879,6 +880,7 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
 
         # ── Phase 2: Service + OS Detection (open ports only) ────────────
         if last_completed < 2:
+            _check_cancel()
             open_tcp = state["open_tcp_ports"]
             if open_tcp:
                 _update_ui(2, f"Service/OS detection ({len(open_tcp)} open TCP ports)")
@@ -935,6 +937,7 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
 
         # ── Phase 3: UDP ─────────────────────────────────────────────────
         if last_completed < 3:
+            _check_cancel()
             _update_ui(3, "UDP top 500 ports")
             scanner = nmap.PortScanner()
             print(f"    [3/9] UDP top 500 ports...")
@@ -970,6 +973,7 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
 
         # ── Phase 4: Vulnerability Scripts ───────────────────────────────
         if last_completed < 4:
+            _check_cancel()
             if all_open:
                 _update_ui(4, f"Vulnerability scripts on {len(all_open)} ports")
                 port_str = ",".join(str(p) for p in all_open)
@@ -1005,6 +1009,7 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
 
         # ── Phase 5: Comprehensive NSE Enumeration ───────────────────────
         if last_completed < 5:
+            _check_cancel()
             if all_open:
                 _update_ui(5, f"Comprehensive NSE enumeration (64 scripts)")
                 port_str = ",".join(str(p) for p in all_open)
@@ -1089,6 +1094,7 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
 
         # ── Phase 6: GeoIP & DNS ─────────────────────────────────────────
         if last_completed < 6:
+            _check_cancel()
             _update_ui(6, "GeoIP & DNS reverse lookup")
             scanner = nmap.PortScanner()
             print(f"    [6/9] GeoIP & DNS reverse lookup...")
@@ -1114,6 +1120,7 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
 
         # ── Phase 7: Firewall Detection ──────────────────────────────────
         if last_completed < 7:
+            _check_cancel()
             open_tcp = state["open_tcp_ports"]
             if open_tcp:
                 test_ports = open_tcp[:10]
@@ -1153,6 +1160,7 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
 
         # ── Phase 8: IP Protocol Scan ────────────────────────────────────
         if last_completed < 8:
+            _check_cancel()
             _update_ui(8, "IP Protocol scan")
             scanner = nmap.PortScanner()
             print(f"    [8/9] IP Protocol scan...")
@@ -1169,6 +1177,7 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
 
         # ── Phase 9: SCTP Scan ───────────────────────────────────────────
         if last_completed < 9:
+            _check_cancel()
             _update_ui(9, "SCTP Init scan (top 100)")
             scanner = nmap.PortScanner()
             print(f"    [9/9] SCTP Init scan (top 100)...")
@@ -1596,6 +1605,13 @@ def nmap_scan_ips_gen(
 
         try:
             i, ip = ip_index_tuple
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled(engine_thread_id=engine_thread_id):
+                    return {"ip": ip, "error": "Scan cancelled by user"}
+            except ImportError:
+                pass
+
             print(f"\n[{i}/{total}] Scanning: {ip}")
 
             if multiphase:
@@ -1655,6 +1671,12 @@ def nmap_scan_ips_gen(
         with ThreadPoolExecutor(max_workers=num_workers) as pool:
             futures = {pool.submit(_scan_worker, item): item for item in indexed_ips}
             for future in as_completed(futures):
+                try:
+                    from engine_progress import is_cancelled
+                    if is_cancelled(engine_thread_id=engine_thread_id):
+                        raise InterruptedError("Engine cancelled by user")
+                except ImportError:
+                    pass
                 result = future.result()
                 all_results.append(result)
                 completed_count += 1

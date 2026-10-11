@@ -155,7 +155,7 @@ class EngineManager:
     def _run_engine_thread(self, record: EngineRecord):
         """Background thread that executes the engine."""
         from engine_progress import set_context, clear_context
-        from engine_progress import _progress_queues, _cancel_events
+        from engine_progress import _progress_queues, _cancel_events, _cancel_events_by_engine
         from chat_persistence import ChatDB
 
         engine_tid = record.engine_thread_id
@@ -168,6 +168,7 @@ class EngineManager:
         # the engine-specific queue instead of the chat-level queue
         _progress_queues[chat_tid] = record.progress_queue
         _cancel_events[chat_tid] = record.cancel_event
+        _cancel_events_by_engine[engine_tid] = record.cancel_event
 
         try:
             if record.engine_type == "query":
@@ -286,9 +287,16 @@ class EngineManager:
     def pause_engine(self, engine_thread_id: str):
         """Signal an engine to pause (sets the cancel event)."""
         record = self._engines.get(engine_thread_id)
-        if record and record.status == "running":
+        if record:
             record.cancel_event.set()
-            # The engine thread will catch InterruptedError and set status to "paused"
+        try:
+            from engine_progress import cancel_engine
+            cancel_engine(
+                chat_thread_id=record.chat_thread_id if record else None,
+                engine_thread_id=engine_thread_id,
+            )
+        except Exception:
+            pass
 
     def resume_engine(self, engine_thread_id: str, chat_thread_id: str) -> EngineRecord | None:
         """Resume a paused engine by starting a new background thread.
@@ -325,6 +333,13 @@ class EngineManager:
         record.progress_queue = queue_module.Queue()
         record.status = "running"
         record.error = None
+
+        try:
+            from engine_progress import _cancel_events, _cancel_events_by_engine
+            _cancel_events_by_engine[engine_thread_id] = record.cancel_event
+            _cancel_events[chat_thread_id] = record.cancel_event
+        except Exception:
+            pass
 
         with self._lock:
             self._engines[engine_thread_id] = record

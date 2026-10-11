@@ -368,11 +368,13 @@ export default function App() {
   // ─────────────────────────────────────────────────────────────────────────
 
   const handleStopEngine = async () => {
-    if (!activeEngine || activeEngine.status !== 'running') return
+    if (!activeEngine || (activeEngine.status !== 'running' && activeEngine.status !== 'pausing')) return
+    setActiveEngine(prev => prev ? { ...prev, status: 'pausing' } : prev)
     try {
       await fetch(`${API_BASE}/engine/${activeEngine.engine_thread_id}/stop`, { method: 'POST' })
     } catch (err) {
       console.error("Failed to stop engine", err)
+      setActiveEngine(prev => prev ? { ...prev, status: 'running' } : prev)
     }
   }
 
@@ -426,11 +428,14 @@ export default function App() {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Resume Dialog
+  // Resume Dialog & Manual Resume
   // ─────────────────────────────────────────────────────────────────────────
 
   const handleResumeEngine = async (engine) => {
     setResumeDialog(null)
+
+    const toolName = engine.tool_name || engine.tool
+    const displayName = ENGINE_DISPLAY_NAMES[toolName] || engine.engine_name || toolName
 
     try {
       const res = await fetch(`${API_BASE}/engine/${engine.engine_thread_id}/resume`, { method: 'POST' })
@@ -439,9 +444,9 @@ export default function App() {
       if (data.status === 'resumed') {
         connectToEngineStream(
           engine.engine_thread_id,
-          ENGINE_DISPLAY_NAMES[engine.tool_name] || engine.tool_name,
-          engine.tool_name,
-          engine.progress || {}
+          displayName,
+          toolName,
+          engine.progress || engine.nodes || {}
         )
       }
     } catch (err) {
@@ -608,7 +613,7 @@ export default function App() {
   // Render
   // ─────────────────────────────────────────────────────────────────────────
 
-  const isEngineRunning = activeEngine && activeEngine.status === 'running'
+  const isEngineRunning = activeEngine && (activeEngine.status === 'running' || activeEngine.status === 'pausing')
 
   return (
     <div className="app-container">
@@ -710,6 +715,7 @@ export default function App() {
               <EngineProgressPanel 
                 engine={activeEngine} 
                 onStop={handleStopEngine}
+                onResume={handleResumeEngine}
               />
             )}
 
@@ -793,7 +799,7 @@ function ToolApprovalCard({ approval, onAccept, onDecline }) {
 /**
  * Live Engine Progress Panel — shown while engine runs in background
  */
-function EngineProgressPanel({ engine, onStop }) {
+function EngineProgressPanel({ engine, onStop, onResume }) {
   const predefinedNodes = TOOL_NODE_MAP[engine.tool] || []
   const allNodeKeys = new Set(predefinedNodes.map(n => n.key))
   const dynamicNodes = Object.keys(engine.nodes || {})
@@ -803,6 +809,7 @@ function EngineProgressPanel({ engine, onStop }) {
   const nodeList = [...predefinedNodes, ...dynamicNodes]
   const isDone = engine.status === 'done'
   const isPaused = engine.status === 'paused'
+  const isPausing = engine.status === 'pausing'
   const isError = engine.status === 'error'
 
   return (
@@ -818,8 +825,19 @@ function EngineProgressPanel({ engine, onStop }) {
               <Pause size={14} /> Stop
             </button>
           )}
+          {engine.status === 'pausing' && (
+            <button className="engine-stop-btn disabled" disabled title="Stopping Engine...">
+              <Activity size={14} className="spin" /> Stopping...
+            </button>
+          )}
+          {engine.status === 'paused' && onResume && (
+            <button className="engine-resume-btn" onClick={() => onResume(engine)} title="Resume Engine">
+              <Play size={14} /> Resume
+            </button>
+          )}
           <div className={`engine-status-badge ${engine.status}`}>
             {engine.status === 'running' && <><Activity size={12} /> Running</>}
+            {engine.status === 'pausing' && <><Activity size={12} className="spin" /> Stopping...</>}
             {engine.status === 'done' && <><CheckCircle2 size={12} /> Complete</>}
             {engine.status === 'paused' && <><Pause size={12} /> Paused</>}
             {engine.status === 'error' && <><AlertTriangle size={12} /> Error</>}
@@ -832,6 +850,7 @@ function EngineProgressPanel({ engine, onStop }) {
           const nodeState = engine.nodes?.[nodeDef.key] || { status: 'pending', detail: '' }
           let displayStatus = nodeState.status
           if (isDone) displayStatus = 'done'
+          if (isPaused && displayStatus === 'running') displayStatus = 'paused'
 
           return (
             <div key={index} className={`node-item ${displayStatus}`}>

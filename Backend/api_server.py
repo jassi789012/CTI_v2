@@ -488,6 +488,21 @@ async def stream_engine(engine_thread_id: str):
 
             # Check if engine is done (after draining queue)
             if record.status in ("done", "error", "paused"):
+                if record.status == "paused":
+                    yield {
+                        "event": "engine_paused",
+                        "data": json.dumps({"type": "engine_paused", "engine_thread_id": engine_thread_id}),
+                    }
+                elif record.status == "done":
+                    yield {
+                        "event": "engine_done",
+                        "data": json.dumps({"type": "engine_done", "engine_thread_id": engine_thread_id}),
+                    }
+                elif record.status == "error":
+                    yield {
+                        "event": "engine_error",
+                        "data": json.dumps({"type": "engine_error", "error": record.error or "Engine error"}),
+                    }
                 return
 
             # Wait for next item with timeout
@@ -502,6 +517,25 @@ async def stream_engine(engine_thread_id: str):
                 if progress.get("type") in ("engine_done", "engine_paused", "engine_error"):
                     return
             except queue_module.Empty:
+                # Check status again in case it just became paused/done
+                if record.status == "paused":
+                    yield {
+                        "event": "engine_paused",
+                        "data": json.dumps({"type": "engine_paused", "engine_thread_id": engine_thread_id}),
+                    }
+                    return
+                elif record.status == "done":
+                    yield {
+                        "event": "engine_done",
+                        "data": json.dumps({"type": "engine_done", "engine_thread_id": engine_thread_id}),
+                    }
+                    return
+                elif record.status == "error":
+                    yield {
+                        "event": "engine_error",
+                        "data": json.dumps({"type": "engine_error", "error": record.error or "Engine error"}),
+                    }
+                    return
                 # Send heartbeat to keep connection alive
                 yield {"event": "heartbeat", "data": "{}"}
 
@@ -519,8 +553,10 @@ async def stop_engine(engine_thread_id: str):
     if record:
         # Signal via EngineManager (sets record.cancel_event)
         mgr.pause_engine(engine_thread_id)
-        # Also signal via engine_progress (sets _cancel_events for the chat)
-        ep_cancel(record.chat_thread_id)
+        # Also signal via engine_progress (sets _cancel_events for both chat and engine)
+        ep_cancel(chat_thread_id=record.chat_thread_id, engine_thread_id=engine_thread_id)
+    else:
+        ep_cancel(engine_thread_id=engine_thread_id)
     
     return {"status": "pausing", "engine_thread_id": engine_thread_id}
 

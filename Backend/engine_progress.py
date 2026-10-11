@@ -41,6 +41,7 @@ _local = threading.local()
 # ─── Global registries (thread-safe via GIL for simple dict ops) ─────────────
 _progress_queues: dict[str, queue_module.Queue] = {}
 _cancel_events: dict[str, threading.Event] = {}
+_cancel_events_by_engine: dict[str, threading.Event] = {}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -65,11 +66,23 @@ def get_progress_queue(chat_thread_id: str) -> queue_module.Queue | None:
     return _progress_queues.get(chat_thread_id)
 
 
-def cancel_engine(chat_thread_id: str):
-    """Signal cancellation for any engine running in this chat."""
-    evt = _cancel_events.get(chat_thread_id)
-    if evt:
-        evt.set()
+def register_engine_cancel(engine_thread_id: str, event: threading.Event = None) -> threading.Event:
+    """Register or get a cancellation event for a specific engine run."""
+    evt = event or threading.Event()
+    _cancel_events_by_engine[engine_thread_id] = evt
+    return evt
+
+
+def cancel_engine(chat_thread_id: str = None, engine_thread_id: str = None):
+    """Signal cancellation for an engine running in this chat or by engine ID."""
+    if chat_thread_id:
+        evt = _cancel_events.get(chat_thread_id)
+        if evt:
+            evt.set()
+    if engine_thread_id:
+        evt = _cancel_events_by_engine.get(engine_thread_id)
+        if evt:
+            evt.set()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -86,6 +99,13 @@ def set_context(chat_thread_id: str, engine_id: str, tool_name: str, tool_call_i
     _local.engine_id = engine_id
     _local.tool_name = tool_name
     _local.tool_call_id = tool_call_id
+
+    # If this engine does not yet have an event in _cancel_events_by_engine,
+    # but the chat has one, link them so checks by either work.
+    if engine_id and chat_thread_id:
+        chat_evt = _cancel_events.get(chat_thread_id)
+        if chat_evt and engine_id not in _cancel_events_by_engine:
+            _cancel_events_by_engine[engine_id] = chat_evt
 
 
 def clear_context():
@@ -150,10 +170,56 @@ def emit_progress(node_name: str, status: str, detail: str = ""):
             pass  # Don't let DB errors break engine execution
 
 
-def is_cancelled() -> bool:
-    """Check if the current engine has been cancelled by the user."""
-    chat_tid = getattr(_local, 'chat_thread_id', None)
-    if not chat_tid:
-        return False
-    evt = _cancel_events.get(chat_tid)
-    return evt.is_set() if evt else False
+def is_cancelled(engine_thread_id: str = None, chat_thread_id: str = None) -> bool:
+    """Check if the current engine has been cancelled by the user.
+    
+    Supports:
+      1. Explicit engine_thread_id
+      2. Explicit chat_thread_id
+      3. Thread-local engine_id
+      4. Thread-local chat_thread_id
+      5. Fallback inspection of EngineManager in-memory record
+    """
+    # 1. Direct engine_thread_id check
+    if engine_thread_id:
+        evt = _cancel_events_by_engine.get(engine_thread_id)
+        if evt and evt.is_set():
+            return True
+
+    # 2. Direct chat_thread_id check
+    if chat_thread_id:
+        evt = _cancel_events.get(chat_thread_id)
+        if evt and evt.is_set():
+            return True
+
+    # 3. Thread-local engine_id check
+    local_engine = getattr(_local, 'engine_id', None)
+    if local_engine:
+        evt = _cancel_events_by_engine.get(local_engine)
+        if evt and evt.is_set():
+            return True
+
+    # 4. Thread-local chat_thread_id check
+    local_chat = getattr(_local, 'chat_thread_id', None)
+    if local_chat:
+        evt = _cancel_events.get(local_chat)
+        if evt and evt.is_set():
+            return True
+
+    # 5. Fallback inspection via EngineManager
+    try:
+        from engine_manager import EngineManager
+        mgr = EngineManager()
+        target_eid = engine_thread_id or local_engine
+        if target_eid:
+            rec = mgr.get_record(target_eid)
+            if rec and (rec.cancel_event.is_set() or rec.status == "paused"):
+                return True
+        if local_chat:
+            rec = mgr.get_running_engine(local_chat)
+            if rec and (rec.cancel_event.is_set() or rec.status == "paused"):
+                return True
+    except Exception:
+        pass
+
+    return False
