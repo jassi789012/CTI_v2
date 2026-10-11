@@ -746,345 +746,614 @@ def _extract_structured_data(result):
 # Full-Spectrum Multi-Phase Scan (single IP)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _scan_ip_multiphase(ip: str) -> dict:
+def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
     """
-    Run a full-spectrum 8-phase Nmap scan on a single IP.
+    Run a full-spectrum 9-phase Nmap scan on a single IP.
 
-    Returns a structured dict matching the shape expected by
-    db_manager.save_nmap_scan().
+    Phases (split from original 8 for performance):
+      1. Fast TCP port discovery (SYN scan, all 65535 ports, NO version detection)
+      2. Service/version + OS detection on discovered open ports only
+      3. UDP top 500 ports
+      4. Vulnerability scripts on all open ports
+      5. Comprehensive NSE enumeration (64 scripts)
+      6. GeoIP & DNS reverse lookup
+      7. Firewall detection (ACK scan)
+      8. IP Protocol scan
+      9. SCTP Init scan
+
+    If engine_thread_id is provided, each phase saves a checkpoint to DB.
+    On restart with the same (ip, engine_thread_id), completed phases are skipped.
     """
     print(f"\n  [*] Starting FULL-SPECTRUM scan on {ip}")
     start_time = time.time()
 
-    scanner = nmap.PortScanner()
+    # ── Checkpoint setup ─────────────────────────────────────────────────
+    cp_db = None
+    last_completed = 0
+    state = {
+        "merged_ports": {},
+        "merged_hostscripts": {},
+        "os_detection": [],
+        "traceroute": [],
+        "host_status": None,
+        "open_tcp_ports": [],
+        "open_udp_ports": [],
+        "hostnames": [],
+        "mac_address": None,
+        "mac_vendor": None,
+        "uptime": None,
+        "tcp_sequence": None,
+        "geolocation": None,
+        "whois": None,
+        "firewall_detection": None,
+        "ip_protocols": [],
+    }
 
-    # Accumulators — merged across all phases
-    merged_ports = {}      # key: "port/proto"
-    merged_hostscripts = {}
-    os_detection = []
-    traceroute = []
-    geolocation = None
-    firewall_detection = None
-    ip_protocols = []
-    whois_info = None
-    host_status = None
+    if engine_thread_id:
+        try:
+            cp_db = DBManager()
+            cp_db.init_tables()
+            checkpoint = cp_db.load_nmap_checkpoint(ip, engine_thread_id)
+            if checkpoint:
+                last_completed = checkpoint["last_phase"]
+                state = checkpoint["state_data"]
+                
+                # Safeguard: cap ports if loading from an older uncapped checkpoint
+                if len(state.get("open_tcp_ports", [])) > 200:
+                    state["open_tcp_ports"] = state["open_tcp_ports"][:200]
+                if len(state.get("open_udp_ports", [])) > 200:
+                    state["open_udp_ports"] = state["open_udp_ports"][:200]
+                    
+                print(f"  [*] Resuming from phase {last_completed + 1}/9 "
+                      f"(phases 1–{last_completed} cached)")
+        except Exception as e:
+            print(f"  [!] Checkpoint load error: {e}")
 
-    # ── Phase 1: TCP Discovery ───────────────────────────────────────────
-    _phase1_tcp_discovery(scanner, ip)
-    p1 = _parse_phase_host(scanner, ip)
+    def _save_cp(phase_num):
+        if cp_db:
+            try:
+                cp_db.save_nmap_checkpoint(ip, engine_thread_id, phase_num, state)
+            except Exception as e:
+                print(f"  [!] Checkpoint save error (phase {phase_num}): {e}")
 
-    if p1["status"] is None:
-        elapsed = round(time.time() - start_time, 1)
-        print(f"  [-] {ip}: Host seems down ({elapsed}s)")
-        return {"ip": ip, "error": "Host down or not responding"}
+    def _check_cancel():
+        try:
+            from engine_progress import is_cancelled
+            if is_cancelled():
+                raise InterruptedError("Engine cancelled by user")
+        except ImportError:
+            pass
 
-    host_status = p1["status"]
-    os_detection = p1["os_detection"]
-    traceroute = p1["traceroute"]
-    merged_ports.update(p1["ports"])
-    merged_hostscripts.update(p1.get("hostscripts", {}))
-
-    open_tcp_ports = [
-        v["port"] for v in merged_ports.values()
-        if v.get("state") == "open" and v.get("protocol") == "tcp"
-    ]
-    print(f"    → Found {len(open_tcp_ports)} open TCP ports")
-
-    # ── Phase 2: UDP ─────────────────────────────────────────────────────
-    _phase2_udp(scanner, ip)
-    p2 = _parse_phase_host(scanner, ip)
-    for pk, pv in p2["ports"].items():
-        if pk not in merged_ports:
-            merged_ports[pk] = pv
-    merged_hostscripts.update(p2.get("hostscripts", {}))
-
-    open_udp_ports = [
-        v["port"] for v in merged_ports.values()
-        if v.get("state") == "open" and v.get("protocol") == "udp"
-    ]
-    if open_udp_ports:
-        print(f"    → Found {len(open_udp_ports)} open UDP ports")
-
-    # All open ports for targeted scans
-    all_open_ports = open_tcp_ports + open_udp_ports
-
-    # ── Phase 3: Targeted Vulnerability Scripts ──────────────────────────
-    _phase3_vuln_scripts(scanner, ip, all_open_ports)
-    p3 = _parse_phase_host(scanner, ip)
-    for pk, pv in p3["ports"].items():
-        if pk in merged_ports:
-            merged_ports[pk]["scripts"].update(pv.get("scripts", {}))
-            merged_ports[pk]["product"] = pv.get("product") or merged_ports[pk]["product"]
-            merged_ports[pk]["version"] = pv.get("version") or merged_ports[pk]["version"]
-        else:
-            merged_ports[pk] = pv
-    merged_hostscripts.update(p3.get("hostscripts", {}))
-
-    # ── Phase 4: Comprehensive Enumeration ───────────────────────────────
-    _phase4_comprehensive_enum(scanner, ip, all_open_ports)
-    p4 = _parse_phase_host(scanner, ip)
-    for pk, pv in p4["ports"].items():
-        if pk in merged_ports:
-            merged_ports[pk]["scripts"].update(pv.get("scripts", {}))
-        else:
-            merged_ports[pk] = pv
-    merged_hostscripts.update(p4.get("hostscripts", {}))
-
-    # ── Phase 5: GeoIP & DNS ────────────────────────────────────────────
-    _phase5_geoip_dns(scanner, ip)
-    geo_data = _parse_geoip(scanner, ip)
-    if geo_data:
-        geolocation = geo_data
-        print(f"    → GeoIP: {geo_data.get('country', '?')}, {geo_data.get('city', '?')}")
-
-    # Capture hostscripts from phase 5 (whois, fcrdns, etc.)
-    p5 = _parse_phase_host(scanner, ip)
-    merged_hostscripts.update(p5.get("hostscripts", {}))
-
-    # Parse whois from hostscripts
-    whois_info = _parse_whois(merged_hostscripts)
-
-    # ── Phase 6: Firewall Detection ──────────────────────────────────────
-    _phase6_firewall_detection(scanner, ip, open_tcp_ports)
-    p6 = _parse_phase_host(scanner, ip)
-
-    filtered_count = sum(
-        1 for p in merged_ports.values() if p.get("state") == "filtered"
-    )
-    ack_filtered = sum(
-        1 for p in p6["ports"].values()
-        if p.get("state") in ("filtered", "unfiltered")
-    )
-    if filtered_count > 0 or ack_filtered > 0:
-        firewall_detection = {
-            "filtered_ports_count": filtered_count,
-            "ack_scan_results": {
-                pk: pv.get("state") for pk, pv in p6["ports"].items()
-            },
-            "likely_firewalled": filtered_count > 10,
-        }
-
-    # ── Phase 7: IP Protocol Scan ────────────────────────────────────────
-    _phase7_ip_protocol_scan(scanner, ip)
-    ip_protocols = _parse_ip_protocol_scan(scanner, ip)
-    if ip_protocols:
-        print(f"    → IP protocols: {len(ip_protocols)} discovered")
-
-    # ── Phase 8: SCTP Scan ───────────────────────────────────────────────
-    _phase8_sctp_scan(scanner, ip)
-    p8 = _parse_phase_host(scanner, ip)
-    for pk, pv in p8["ports"].items():
-        if pk not in merged_ports:
-            merged_ports[pk] = pv
-    sctp_ports = [
-        v["port"] for v in p8["ports"].values()
-        if v.get("state") == "open"
-    ]
-    if sctp_ports:
-        print(f"    → SCTP: {len(sctp_ports)} open ports")
-
-    # ── Post-process: extract structured data from scripts ───────────────
-    result_for_parsing = {"_merged_ports": merged_ports}
-    _extract_structured_data(result_for_parsing)
-
-    # ── Build final output matching save_nmap_scan() shape ───────────────
-
-    # Hostnames
-    hostnames = []
     try:
-        if ip in scanner.all_hosts():
-            for hn in scanner[ip].get("hostnames", []):
-                if hn.get("name"):
-                    hostnames.append({
-                        "name": hn.get("name", ""),
-                        "type": hn.get("type", ""),
-                    })
-    except Exception:
-        pass
+        from engine_progress import emit_progress
+        node_name = f"nmap_{ip.replace('.', '_')}"
+    except ImportError:
+        emit_progress = None
 
-    # MAC address
-    mac_address = None
-    mac_vendor = None
+    def _update_ui(phase: int, desc: str):
+        if emit_progress:
+            try:
+                emit_progress(node_name, "running", f"Phase {phase}/9: {desc}")
+            except Exception:
+                pass
+
     try:
-        if ip in scanner.all_hosts():
-            host_data = scanner[ip]
-            if "mac" in host_data.get("addresses", {}):
-                mac_address = host_data["addresses"]["mac"]
-            vendor_dict = host_data.get("vendor", {})
-            if vendor_dict and mac_address:
-                mac_vendor = vendor_dict.get(mac_address, "")
-    except Exception:
-        pass
+        # ── Phase 1: Fast TCP Port Discovery ─────────────────────────────
+        if last_completed < 1:
+            _update_ui(1, "TCP port discovery (all 65535 ports)")
+            scanner = nmap.PortScanner()
+            print(f"    [1/9] TCP port discovery (all 65535 ports)...")
+            try:
+                scanner.scan(
+                    hosts=ip,
+                    arguments=f"-sS -T4 {TCP_PORT_ARGS} --open --reason",
+                )
+            except Exception as e:
+                print(f"    [!] Phase 1 error: {e}")
 
-    # Uptime
-    uptime = None
-    try:
-        if ip in scanner.all_hosts():
-            host_data = scanner[ip]
-            if host_data.get("uptime"):
-                uptime = {
-                    "seconds": host_data["uptime"].get("seconds", ""),
-                    "lastboot": host_data["uptime"].get("lastboot", ""),
-                }
-    except Exception:
-        pass
+            if ip not in scanner.all_hosts() or scanner[ip].state() is None:
+                elapsed = round(time.time() - start_time, 1)
+                print(f"  [-] {ip}: Host seems down ({elapsed}s)")
+                if emit_progress: emit_progress(node_name, "error", "Host down")
+                return {"ip": ip, "error": "Host down or not responding"}
 
-    # TCP sequence
-    tcp_sequence = None
-    try:
-        if ip in scanner.all_hosts():
-            host_data = scanner[ip]
-            if host_data.get("tcp_sequence"):
-                tcp_sequence = host_data["tcp_sequence"]
-    except Exception:
-        pass
+            state["host_status"] = scanner[ip].state()
+            open_tcp = []
+            for proto in scanner[ip].all_protocols():
+                if proto == "tcp":
+                    for port_num in sorted(scanner[ip][proto].keys()):
+                        if scanner[ip][proto][port_num].get("state") == "open":
+                            open_tcp.append(port_num)
+            
+            if len(open_tcp) > 200:
+                print(f"    [!] Found {len(open_tcp)} open TCP ports (honeypot suspected). Capping at 200.")
+                open_tcp = open_tcp[:200]
+                
+            state["open_tcp_ports"] = open_tcp
+            print(f"    → Proceeding with {len(open_tcp)} open TCP ports")
+            _save_cp(1)
+            _check_cancel()
 
-    best_os = os_detection[0]["name"] if os_detection else None
+        if not state["host_status"]:
+            return {"ip": ip, "error": "Host down or not responding"}
 
-    # ── Convert merged_ports → port_banners (DB-compatible format) ───────
-    open_ports_list = []
-    port_banners = []
+        # ── Phase 2: Service + OS Detection (open ports only) ────────────
+        if last_completed < 2:
+            open_tcp = state["open_tcp_ports"]
+            if open_tcp:
+                _update_ui(2, f"Service/OS detection ({len(open_tcp)} open TCP ports)")
+                port_str = ",".join(str(p) for p in open_tcp)
+                scanner = nmap.PortScanner()
+                print(f"    [2/9] Service detection + OS on {len(open_tcp)} ports...")
+                try:
+                    scanner.scan(
+                        hosts=ip,
+                        arguments=(
+                            f"-sV --version-intensity 5 -sC -O -T4 "
+                            f"-p {port_str} --traceroute --reason"
+                        ),
+                    )
+                except Exception as e:
+                    print(f"    [!] Phase 2 error: {e}")
 
-    for port_key, port_data in sorted(merged_ports.items()):
-        state = port_data.get("state", "")
-        if state not in ("open", "open|filtered", "filtered"):
-            continue
+                p2 = _parse_phase_host(scanner, ip)
+                state["merged_ports"].update(p2["ports"])
+                state["os_detection"] = p2["os_detection"]
+                state["traceroute"] = p2["traceroute"]
+                state["merged_hostscripts"].update(p2.get("hostscripts", {}))
 
-        port_num = port_data["port"]
-        proto = port_data["protocol"]
-        open_ports_list.append(port_num)
-
-        # Build version string
-        product = port_data.get("product", "")
-        version = port_data.get("version", "")
-        extrainfo = port_data.get("extra_info", "")
-        version_parts = []
-        if product:
-            version_parts.append(product)
-        if version:
-            version_parts.append(version)
-        if extrainfo:
-            version_parts.append(f"({extrainfo})")
-        version_str = " ".join(version_parts) if version_parts else None
-
-        # Separate scripts into vuln vs enumeration
-        all_scripts = port_data.get("scripts", {})
-        vuln_scripts = {}
-        enum_scripts = {}
-        http_title = None
-        banner_text = None
-        cve_details = []
-
-        for script_id, script_output in all_scripts.items():
-            if script_id == "http-title":
-                http_title = str(script_output).strip()
-            if script_id == "banner":
-                banner_text = str(script_output).strip()
-
-            # Extract CVEs from vuln scripts
-            if "vuln" in script_id or "vulners" in script_id:
-                vuln_scripts[script_id] = script_output
-                cve_details.extend(_extract_cves(script_id, str(script_output)))
+                # Extract host-level data NOW before scanner is overwritten
+                try:
+                    if ip in scanner.all_hosts():
+                        host = scanner[ip]
+                        for hn in host.get("hostnames", []):
+                            if hn.get("name"):
+                                state["hostnames"].append({
+                                    "name": hn["name"],
+                                    "type": hn.get("type", ""),
+                                })
+                        if "mac" in host.get("addresses", {}):
+                            state["mac_address"] = host["addresses"]["mac"]
+                        vendor_dict = host.get("vendor", {})
+                        if vendor_dict and state["mac_address"]:
+                            state["mac_vendor"] = vendor_dict.get(
+                                state["mac_address"], ""
+                            )
+                        if host.get("uptime"):
+                            state["uptime"] = {
+                                "seconds": host["uptime"].get("seconds", ""),
+                                "lastboot": host["uptime"].get("lastboot", ""),
+                            }
+                        if host.get("tcp_sequence"):
+                            state["tcp_sequence"] = host["tcp_sequence"]
+                except Exception:
+                    pass
             else:
-                enum_scripts[script_id] = script_output
+                print(f"    [2/9] Service detection skipped (no open ports)")
+            _save_cp(2)
+            _check_cancel()
 
-        # Build extra dict with all enriched data
-        extra = {
-            "reason": port_data.get("reason", ""),
-            "product": product,
-            "service_version": version,
-            "extra_info": extrainfo,
-            "conf": port_data.get("conf", ""),
-            "cpe": port_data.get("cpe", ""),
-            "vulnerability_scripts": vuln_scripts,
-            "enumeration_scripts": enum_scripts,
+        # ── Phase 3: UDP ─────────────────────────────────────────────────
+        if last_completed < 3:
+            _update_ui(3, "UDP top 500 ports")
+            scanner = nmap.PortScanner()
+            print(f"    [3/9] UDP top 500 ports...")
+            try:
+                scanner.scan(
+                    hosts=ip,
+                    arguments="-sU -sV -T4 --top-ports 500 --version-intensity 0 --open",
+                )
+            except Exception as e:
+                print(f"    [!] Phase 3 (UDP) error: {e}")
+
+            p3 = _parse_phase_host(scanner, ip)
+            for pk, pv in p3["ports"].items():
+                if pk not in state["merged_ports"]:
+                    state["merged_ports"][pk] = pv
+            state["merged_hostscripts"].update(p3.get("hostscripts", {}))
+
+            open_udp = [
+                v["port"] for v in p3["ports"].values()
+                if v.get("state") == "open" and v.get("protocol") == "udp"
+            ]
+            if len(open_udp) > 200:
+                print(f"    [!] Found {len(open_udp)} open UDP ports. Capping at 200.")
+                open_udp = open_udp[:200]
+                
+            state["open_udp_ports"] = open_udp
+            if open_udp:
+                print(f"    → Proceeding with {len(open_udp)} open UDP ports")
+            _save_cp(3)
+            _check_cancel()
+
+        all_open = state["open_tcp_ports"] + state["open_udp_ports"]
+
+        # ── Phase 4: Vulnerability Scripts ───────────────────────────────
+        if last_completed < 4:
+            if all_open:
+                _update_ui(4, f"Vulnerability scripts on {len(all_open)} ports")
+                port_str = ",".join(str(p) for p in all_open)
+                scanner = nmap.PortScanner()
+                print(f"    [4/9] Vulnerability scripts on {len(all_open)} ports...")
+                try:
+                    scanner.scan(
+                        hosts=ip,
+                        arguments=f"-sV -T4 -p {port_str} --script vuln,vulners",
+                    )
+                except Exception as e:
+                    print(f"    [!] Phase 4 (vuln) error: {e}")
+
+                p4 = _parse_phase_host(scanner, ip)
+                for pk, pv in p4["ports"].items():
+                    if pk in state["merged_ports"]:
+                        state["merged_ports"][pk]["scripts"].update(
+                            pv.get("scripts", {})
+                        )
+                        state["merged_ports"][pk]["product"] = (
+                            pv.get("product") or state["merged_ports"][pk]["product"]
+                        )
+                        state["merged_ports"][pk]["version"] = (
+                            pv.get("version") or state["merged_ports"][pk]["version"]
+                        )
+                    else:
+                        state["merged_ports"][pk] = pv
+                state["merged_hostscripts"].update(p4.get("hostscripts", {}))
+            else:
+                print(f"    [4/9] Vulnerability scripts skipped (no open ports)")
+            _save_cp(4)
+            _check_cancel()
+
+        # ── Phase 5: Comprehensive NSE Enumeration ───────────────────────
+        if last_completed < 5:
+            if all_open:
+                _update_ui(5, f"Comprehensive NSE enumeration (64 scripts)")
+                port_str = ",".join(str(p) for p in all_open)
+                scripts = [
+                    # SSL/TLS
+                    "ssl-enum-ciphers", "ssl-cert", "ssl-dh-params",
+                    "ssl-heartbleed", "ssl-poodle", "ssl-ccs-injection",
+                    "ssl-known-key",
+                    # HTTP
+                    "http-title", "http-headers", "http-methods",
+                    "http-robots.txt", "http-server-header", "http-enum",
+                    "http-auth-finder", "http-waf-detect", "http-waf-fingerprint",
+                    "http-sitemap-generator", "http-security-headers",
+                    "http-cors", "http-cookie-flags", "http-php-version",
+                    "http-generator", "http-open-proxy", "http-open-redirect",
+                    # DNS
+                    "dns-nsid", "dns-brute", "dns-zone-transfer",
+                    "dns-srv-enum", "dns-recursion", "dns-cache-snoop",
+                    # SSH
+                    "ssh-hostkey", "ssh2-enum-algos", "ssh-auth-methods",
+                    # SMB / NetBIOS
+                    "smb-os-discovery", "smb-enum-shares", "smb-security-mode",
+                    "smb2-capabilities", "smb2-security-mode", "smb-enum-users",
+                    "smb-enum-sessions", "nbstat",
+                    # SNMP
+                    "snmp-info", "snmp-sysdescr", "snmp-interfaces",
+                    "snmp-processes",
+                    # Databases
+                    "mysql-info", "mysql-enum", "mongodb-info",
+                    "redis-info", "pgsql-info", "ms-sql-info",
+                    "couchdb-stats",
+                    # Mail
+                    "smtp-commands", "smtp-enum-users",
+                    "pop3-capabilities", "imap-capabilities",
+                    # FTP
+                    "ftp-anon", "ftp-syst",
+                    # RDP
+                    "rdp-enum-encryption", "rdp-ntlm-info",
+                    # VNC
+                    "vnc-info", "vnc-title",
+                    # NTP
+                    "ntp-info", "ntp-monlist",
+                    # LDAP
+                    "ldap-rootdse", "ldap-search",
+                    # Telnet
+                    "telnet-encryption", "telnet-ntlm-info",
+                    # SIP / VoIP
+                    "sip-methods", "sip-enum-users",
+                    # MQTT / IoT
+                    "mqtt-subscribe",
+                    # Docker / Kubernetes
+                    "docker-version", "kubernetes-info",
+                    # XMPP
+                    "xmpp-info",
+                    # Banner
+                    "banner",
+                ]
+                script_str = ",".join(scripts)
+                scanner = nmap.PortScanner()
+                print(f"    [5/9] Comprehensive enumeration ({len(scripts)} scripts)...")
+                try:
+                    scanner.scan(
+                        hosts=ip,
+                        arguments=f"-sV -T4 -p {port_str} --script {script_str}",
+                    )
+                except Exception as e:
+                    print(f"    [!] Phase 5 (enum) error: {e}")
+
+                p5 = _parse_phase_host(scanner, ip)
+                for pk, pv in p5["ports"].items():
+                    if pk in state["merged_ports"]:
+                        state["merged_ports"][pk]["scripts"].update(
+                            pv.get("scripts", {})
+                        )
+                    else:
+                        state["merged_ports"][pk] = pv
+                state["merged_hostscripts"].update(p5.get("hostscripts", {}))
+            else:
+                print(f"    [5/9] Enumeration scripts skipped (no open ports)")
+            _save_cp(5)
+            _check_cancel()
+
+        # ── Phase 6: GeoIP & DNS ─────────────────────────────────────────
+        if last_completed < 6:
+            _update_ui(6, "GeoIP & DNS reverse lookup")
+            scanner = nmap.PortScanner()
+            print(f"    [6/9] GeoIP & DNS reverse lookup...")
+            try:
+                scanner.scan(
+                    hosts=ip,
+                    arguments="-sn --script ip-geolocation-geoplugin,whois-ip,dns-brute,fcrdns",
+                )
+            except Exception as e:
+                print(f"    [!] Phase 6 (GeoIP) error: {e}")
+
+            geo_data = _parse_geoip(scanner, ip)
+            if geo_data:
+                state["geolocation"] = geo_data
+                print(f"    → GeoIP: {geo_data.get('country', '?')}, "
+                      f"{geo_data.get('city', '?')}")
+
+            p6 = _parse_phase_host(scanner, ip)
+            state["merged_hostscripts"].update(p6.get("hostscripts", {}))
+            state["whois"] = _parse_whois(state["merged_hostscripts"])
+            _save_cp(6)
+            _check_cancel()
+
+        # ── Phase 7: Firewall Detection ──────────────────────────────────
+        if last_completed < 7:
+            open_tcp = state["open_tcp_ports"]
+            if open_tcp:
+                test_ports = open_tcp[:10]
+                _update_ui(7, f"Firewall detection on {len(test_ports)} ports")
+                port_str = ",".join(str(p) for p in test_ports)
+                scanner = nmap.PortScanner()
+                print(f"    [7/9] Firewall detection on {len(test_ports)} ports...")
+                try:
+                    scanner.scan(
+                        hosts=ip,
+                        arguments=f"-sA -T4 -p {port_str}",
+                    )
+                except Exception as e:
+                    print(f"    [!] Phase 7 (firewall) error: {e}")
+
+                p7 = _parse_phase_host(scanner, ip)
+                filtered_count = sum(
+                    1 for pv in state["merged_ports"].values()
+                    if pv.get("state") == "filtered"
+                )
+                ack_filtered = sum(
+                    1 for pv in p7["ports"].values()
+                    if pv.get("state") in ("filtered", "unfiltered")
+                )
+                if filtered_count > 0 or ack_filtered > 0:
+                    state["firewall_detection"] = {
+                        "filtered_ports_count": filtered_count,
+                        "ack_scan_results": {
+                            pk: pv.get("state") for pk, pv in p7["ports"].items()
+                        },
+                        "likely_firewalled": filtered_count > 10,
+                    }
+            else:
+                print(f"    [7/9] Firewall detection skipped (no open ports)")
+            _save_cp(7)
+            _check_cancel()
+
+        # ── Phase 8: IP Protocol Scan ────────────────────────────────────
+        if last_completed < 8:
+            _update_ui(8, "IP Protocol scan")
+            scanner = nmap.PortScanner()
+            print(f"    [8/9] IP Protocol scan...")
+            try:
+                scanner.scan(hosts=ip, arguments="-sO -T4")
+            except Exception as e:
+                print(f"    [!] Phase 8 (protocol) error: {e}")
+
+            state["ip_protocols"] = _parse_ip_protocol_scan(scanner, ip)
+            if state["ip_protocols"]:
+                print(f"    → IP protocols: {len(state['ip_protocols'])} discovered")
+            _save_cp(8)
+            _check_cancel()
+
+        # ── Phase 9: SCTP Scan ───────────────────────────────────────────
+        if last_completed < 9:
+            _update_ui(9, "SCTP Init scan (top 100)")
+            scanner = nmap.PortScanner()
+            print(f"    [9/9] SCTP Init scan (top 100)...")
+            try:
+                scanner.scan(hosts=ip, arguments="-sY -T4 --top-ports 100 --open")
+            except Exception as e:
+                print(f"    [!] Phase 9 (SCTP) error: {e}")
+
+            p9 = _parse_phase_host(scanner, ip)
+            for pk, pv in p9["ports"].items():
+                if pk not in state["merged_ports"]:
+                    state["merged_ports"][pk] = pv
+            sctp_ports = [
+                v["port"] for v in p9["ports"].values()
+                if v.get("state") == "open"
+            ]
+            if sctp_ports:
+                print(f"    → SCTP: {len(sctp_ports)} open ports")
+            _save_cp(9)
+
+        # ── All phases complete — cleanup checkpoint ─────────────────────
+        if cp_db and engine_thread_id:
+            try:
+                cp_db.delete_nmap_checkpoint(ip, engine_thread_id)
+            except Exception:
+                pass
+
+        # ── Post-process: extract structured data from scripts ───────────
+        result_for_parsing = {"_merged_ports": state["merged_ports"]}
+        _extract_structured_data(result_for_parsing)
+
+        # ── Build final output matching save_nmap_scan() shape ───────────
+        best_os = (
+            state["os_detection"][0]["name"] if state["os_detection"] else None
+        )
+
+        # Convert merged_ports → port_banners (DB-compatible format)
+        open_ports_list = []
+        port_banners = []
+
+        for port_key, port_data in sorted(state["merged_ports"].items()):
+            port_state = port_data.get("state", "")
+            if port_state not in ("open", "open|filtered", "filtered"):
+                continue
+
+            port_num = port_data["port"]
+            proto = port_data["protocol"]
+            open_ports_list.append(port_num)
+
+            # Build version string
+            product = port_data.get("product", "")
+            version = port_data.get("version", "")
+            extrainfo = port_data.get("extra_info", "")
+            version_parts = []
+            if product:
+                version_parts.append(product)
+            if version:
+                version_parts.append(version)
+            if extrainfo:
+                version_parts.append(f"({extrainfo})")
+            version_str = " ".join(version_parts) if version_parts else None
+
+            # Separate scripts into vuln vs enumeration
+            all_scripts = port_data.get("scripts", {})
+            vuln_scripts = {}
+            enum_scripts = {}
+            http_title = None
+            banner_text = None
+            cve_details = []
+
+            for script_id, script_output in all_scripts.items():
+                if script_id == "http-title":
+                    http_title = str(script_output).strip()
+                if script_id == "banner":
+                    banner_text = str(script_output).strip()
+                if "vuln" in script_id or "vulners" in script_id:
+                    vuln_scripts[script_id] = script_output
+                    cve_details.extend(
+                        _extract_cves(script_id, str(script_output))
+                    )
+                else:
+                    enum_scripts[script_id] = script_output
+
+            extra = {
+                "reason": port_data.get("reason", ""),
+                "product": product,
+                "service_version": version,
+                "extra_info": extrainfo,
+                "conf": port_data.get("conf", ""),
+                "cpe": port_data.get("cpe", ""),
+                "vulnerability_scripts": vuln_scripts,
+                "enumeration_scripts": enum_scripts,
+            }
+            if port_data.get("ssl_certificate_parsed"):
+                extra["ssl_certificate"] = port_data["ssl_certificate_parsed"]
+            if port_data.get("http_security_headers_parsed"):
+                extra["http_security_headers"] = port_data[
+                    "http_security_headers_parsed"
+                ]
+
+            port_banners.append({
+                "port": port_num,
+                "protocol": proto,
+                "state": port_state,
+                "service": port_data.get("service", ""),
+                "version": version_str,
+                "http_title": http_title,
+                "banner": banner_text,
+                "cve_details": cve_details,
+                "extra": extra,
+            })
+
+        # ── Scan info ────────────────────────────────────────────────────
+        elapsed = round(time.time() - start_time, 1)
+
+        total_cves = sum(
+            len(pb.get("cve_details", [])) for pb in port_banners
+        )
+        total_vuln_scripts = sum(
+            len(pb.get("extra", {}).get("vulnerability_scripts", {}))
+            for pb in port_banners
+        )
+        total_enum_scripts = sum(
+            len(pb.get("extra", {}).get("enumeration_scripts", {}))
+            for pb in port_banners
+        )
+
+        print(f"  [+] {ip}: {state['host_status']}, "
+              f"{len(open_ports_list)} open ports, "
+              f"{len(state['os_detection'])} OS matches, "
+              f"{total_cves} CVEs, "
+              f"{total_vuln_scripts} vuln scripts, "
+              f"{total_enum_scripts} enum scripts, "
+              f"{len(state['ip_protocols'])} IP protocols, "
+              f"{elapsed}s elapsed")
+
+        general_info = {
+            "OS": best_os,
+            "hostnames": state["hostnames"],
+            "host_state": state["host_status"],
+            "host_reason": "",
+            "mac_address": state["mac_address"],
+            "mac_vendor": state["mac_vendor"],
         }
 
-        # Add structured parsed data if available
-        if port_data.get("ssl_certificate_parsed"):
-            extra["ssl_certificate"] = port_data["ssl_certificate_parsed"]
-        if port_data.get("http_security_headers_parsed"):
-            extra["http_security_headers"] = port_data["http_security_headers_parsed"]
+        result = {
+            "ip": ip,
+            "general_info": general_info,
+            "open_ports": open_ports_list,
+            "port_banners": port_banners,
+            "os_detection": state["os_detection"],
+            "uptime": state["uptime"],
+            "tcp_sequence": state["tcp_sequence"],
+            "traceroute": state["traceroute"],
+            "geolocation": state["geolocation"],
+            "whois": state["whois"],
+            "firewall_detection": state["firewall_detection"],
+            "ip_protocols": state["ip_protocols"],
+            "hostscripts": state["merged_hostscripts"] or None,
+            "scan_info": {
+                "scan_phases": 9,
+                "tcp_port_args": TCP_PORT_ARGS,
+            },
+            "scan_duration_seconds": elapsed,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+        }
 
-        port_banners.append({
-            "port": port_num,
-            "protocol": proto,
-            "state": state,
-            "service": port_data.get("service", ""),
-            "version": version_str,
-            "http_title": http_title,
-            "banner": banner_text,
-            "cve_details": cve_details,
-            "extra": extra,
-        })
+        if result_for_parsing.get("ssh_info"):
+            result["ssh_info"] = result_for_parsing["ssh_info"]
+        if result_for_parsing.get("dns_info"):
+            result["dns_info"] = result_for_parsing["dns_info"]
+        if result_for_parsing.get("smb_info"):
+            result["smb_info"] = result_for_parsing["smb_info"]
+            
+        if emit_progress:
+            emit_progress(node_name, "done", f"Scan complete ({elapsed}s)")
 
-    # ── Scan info ────────────────────────────────────────────────────────
-    scan_info = {
-        "command_line": scanner.command_line() if hasattr(scanner, 'command_line') else "",
-        "nmap_version": scanner.nmap_version() if hasattr(scanner, 'nmap_version') else "",
-        "scan_phases": 8,
-        "tcp_port_args": TCP_PORT_ARGS,
-    }
+        return result
 
-    # ── Summary stats ────────────────────────────────────────────────────
-    total_cves = sum(len(pb.get("cve_details", [])) for pb in port_banners)
-    total_vuln_scripts = sum(
-        len(pb.get("extra", {}).get("vulnerability_scripts", {}))
-        for pb in port_banners
-    )
-    total_enum_scripts = sum(
-        len(pb.get("extra", {}).get("enumeration_scripts", {}))
-        for pb in port_banners
-    )
-    elapsed = round(time.time() - start_time, 1)
-
-    print(f"  [+] {ip}: {host_status}, "
-          f"{len(open_ports_list)} open ports, "
-          f"{len(os_detection)} OS matches, "
-          f"{total_cves} CVEs, "
-          f"{total_vuln_scripts} vuln scripts, "
-          f"{total_enum_scripts} enum scripts, "
-          f"{len(ip_protocols)} IP protocols, "
-          f"{elapsed}s elapsed")
-
-    # ── general_info ─────────────────────────────────────────────────────
-    general_info = {
-        "OS": best_os,
-        "hostnames": hostnames,
-        "host_state": host_status,
-        "host_reason": "",
-        "mac_address": mac_address,
-        "mac_vendor": mac_vendor,
-    }
-
-    result = {
-        "ip": ip,
-        "general_info": general_info,
-        "open_ports": open_ports_list,
-        "port_banners": port_banners,
-        "os_detection": os_detection,
-        "uptime": uptime,
-        "tcp_sequence": tcp_sequence,
-        "traceroute": traceroute,
-        "geolocation": geolocation,
-        "whois": whois_info,
-        "firewall_detection": firewall_detection,
-        "ip_protocols": ip_protocols,
-        "hostscripts": merged_hostscripts if merged_hostscripts else None,
-        "scan_info": scan_info,
-        "scan_duration_seconds": elapsed,
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    # Add enrichments at top level
-    if result_for_parsing.get("ssh_info"):
-        result["ssh_info"] = result_for_parsing["ssh_info"]
-    if result_for_parsing.get("dns_info"):
-        result["dns_info"] = result_for_parsing["dns_info"]
-    if result_for_parsing.get("smb_info"):
-        result["smb_info"] = result_for_parsing["smb_info"]
-
-    return result
+    finally:
+        if cp_db:
+            try:
+                cp_db.close()
+            except Exception:
+                pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1248,6 +1517,7 @@ def nmap_scan_ips_gen(
     ips: list,
     workers: int = None,
     multiphase: bool = True,
+    engine_thread_id: str = None,
 ):
     """
     Generator that scans a list of IPs with Nmap and stores results in PostgreSQL.
@@ -1256,6 +1526,7 @@ def nmap_scan_ips_gen(
         {
             "ip_data_fetcher_nmap": "running" | "completed",
             "ip_data_fetcher_nmap_done": "n/m",
+            "final_results": [...] # Only present on "completed"
         }
 
     Args:
@@ -1307,87 +1578,115 @@ def nmap_scan_ips_gen(
         print(f"[-] Could not connect to database: {e}")
         print("    Results will NOT be saved to PostgreSQL.")
 
+    # Capture context for worker threads
+    parent_context = None
+    try:
+        from engine_progress import get_context, set_context, clear_context
+        parent_context = get_context()
+    except ImportError:
+        pass
+
     # ─── Worker function ─────────────────────────────────────────────────
     def _scan_worker(ip_index_tuple):
-        i, ip = ip_index_tuple
-        print(f"\n[{i}/{total}] Scanning: {ip}")
-
-        if multiphase:
-            parsed = _scan_ip_multiphase(ip)
-        else:
-            nm = nmap.PortScanner()
+        if parent_context and parent_context[0]:
             try:
-                nm.scan(
-                    hosts=ip,
-                    arguments=(
-                        f"-sS -sV -O --script default,vuln,ssl-enum-ciphers,"
-                        f"http-title,http-headers,banner -T4 "
-                        f"{TCP_PORT_ARGS} --open --reason"
-                    ),
-                )
-            except Exception as e:
-                print(f"[-] Nmap error for {ip}: {e}")
-                return {"ip": ip, "error": str(e)}
+                set_context(*parent_context)
+            except Exception:
+                pass
 
-            scanned = nm.all_hosts()
-            if not scanned:
-                print(f"[-] No results for {ip}")
-                return {"ip": ip, "error": "Host down or no response"}
+        try:
+            i, ip = ip_index_tuple
+            print(f"\n[{i}/{total}] Scanning: {ip}")
 
-            try:
-                parsed = parse_scan_result(nm, scanned[0])
-            except Exception as e:
-                print(f"[-] Parse error for {ip}: {e}")
-                return {"ip": ip, "error": str(e)}
-
-        if "error" in parsed:
-            return parsed
-
-        # Save to database
-        if db:
-            with db_lock:
+            if multiphase:
+                parsed = _scan_ip_multiphase(ip, engine_thread_id=engine_thread_id)
+            else:
+                nm = nmap.PortScanner()
                 try:
-                    db.save_nmap_scan(parsed)
+                    nm.scan(
+                        hosts=ip,
+                        arguments=(
+                            f"-sS -sV -O --script default,vuln,ssl-enum-ciphers,"
+                            f"http-title,http-headers,banner -T4 "
+                            f"{TCP_PORT_ARGS} --open --reason"
+                        ),
+                    )
                 except Exception as e:
-                    print(f"    [-] DB save error: {e}")
+                    print(f"[-] Nmap error for {ip}: {e}")
+                    return {"ip": ip, "error": str(e)}
 
-        return parsed
+                scanned = nm.all_hosts()
+                if not scanned:
+                    print(f"[-] No results for {ip}")
+                    return {"ip": ip, "error": "Host down or no response"}
+
+                try:
+                    parsed = parse_scan_result(nm, scanned[0])
+                except Exception as e:
+                    print(f"[-] Parse error for {ip}: {e}")
+                    return {"ip": ip, "error": str(e)}
+
+            if "error" in parsed:
+                return parsed
+
+            # Save to database
+            if db:
+                with db_lock:
+                    try:
+                        db.save_nmap_scan(parsed)
+                    except Exception as e:
+                        print(f"    [-] DB save error: {e}")
+
+            return parsed
+            
+        finally:
+            if parent_context and parent_context[0]:
+                try:
+                    clear_context()
+                except Exception:
+                    pass
 
     # ─── Run workers and yield progress ──────────────────────────────────
     indexed_ips = list(enumerate(unique_ips, 1))
     completed_count = 0
     all_results = []
 
-    with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        futures = {pool.submit(_scan_worker, item): item for item in indexed_ips}
-        for future in as_completed(futures):
-            result = future.result()
-            all_results.append(result)
-            completed_count += 1
-            yield {
-                "ip_data_fetcher_nmap": "running",
-                "ip_data_fetcher_nmap_done": f"{completed_count}/{total}",
-            }
+    try:
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = {pool.submit(_scan_worker, item): item for item in indexed_ips}
+            for future in as_completed(futures):
+                result = future.result()
+                all_results.append(result)
+                completed_count += 1
+                yield {
+                    "ip_data_fetcher_nmap": "running",
+                    "ip_data_fetcher_nmap_done": f"{completed_count}/{total}",
+                }
 
-    # ─── Summary ─────────────────────────────────────────────────────────
-    print(f"\n{'='*70}")
-    success = [r for r in all_results if "error" not in r]
-    failed = [r for r in all_results if "error" in r]
-    total_ports = sum(len(r.get("open_ports", [])) for r in success)
-    total_cves = sum(
-        sum(len(p.get("cve_details", [])) for p in r.get("port_banners", []))
-        for r in success
-    )
-    print(f"  Scan Complete: {len(success)} succeeded, {len(failed)} failed")
-    print(f"  Total: {total_ports} open ports, {total_cves} CVEs detected")
-    print(f"{'='*70}\n")
+        # ─── Summary ─────────────────────────────────────────────────────────
+        print(f"\n{'='*70}")
+        success = [r for r in all_results if "error" not in r]
+        failed = [r for r in all_results if "error" in r]
+        total_ports = sum(len(r.get("open_ports", [])) for r in success)
+        total_cves = sum(
+            sum(len(p.get("cve_details", [])) for p in r.get("port_banners", []))
+            for r in success
+        )
+        print(f"  Scan Complete: {len(success)} succeeded, {len(failed)} failed")
+        print(f"  Total: {total_ports} open ports, {total_cves} CVEs detected")
+        print(f"{'='*70}\n")
 
-    if db:
-        db.close()
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
 
     yield {
         "ip_data_fetcher_nmap": "completed",
         "ip_data_fetcher_nmap_done": f"{total}/{total}",
+        "final_results": all_results,
     }
 
 
@@ -1400,27 +1699,37 @@ def nmap_scan_ips(
     skip_db: bool = False,
     workers: int = None,
     multiphase: bool = True,
+    engine_thread_id: str = None,
 ) -> list:
     """
     Synchronous wrapper — scans IPs and returns results list.
     Internally consumes nmap_scan_ips_gen() for progress tracking.
     """
-    for progress in nmap_scan_ips_gen(ips, workers, multiphase):
-        pass
+    final = []
+    for progress in nmap_scan_ips_gen(ips, workers, multiphase, engine_thread_id):
+        if "final_results" in progress:
+            final = progress["final_results"]
+    return final
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Single-IP function (for Engine / LangGraph use)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_single_ip(ip: str, db=None, multiphase: bool = True) -> dict:
+def scan_single_ip(
+    ip: str, 
+    db=None, 
+    multiphase: bool = True, 
+    engine_thread_id: str = None
+) -> dict:
     """
     Scan a single IP with Nmap and optionally save to database.
 
     Args:
-        ip:         Single IP address to scan.
-        db:         An already-connected DBManager instance (optional).
-        multiphase: If True, run full 8-phase scan.
+        ip:               Single IP address to scan.
+        db:               An already-connected DBManager instance (optional).
+        multiphase:       If True, run full 9-phase scan.
+        engine_thread_id: For checkpointing resume support
 
     Returns:
         dict with keys:
@@ -1439,7 +1748,7 @@ def scan_single_ip(ip: str, db=None, multiphase: bool = True) -> dict:
         return {"status": "error", "ip": ip, "reason": f"Nmap not found: {e}"}
 
     if multiphase:
-        parsed = _scan_ip_multiphase(ip)
+        parsed = _scan_ip_multiphase(ip, engine_thread_id=engine_thread_id)
     else:
         nm = nmap.PortScanner()
         print(f"[*] Nmap scanning: {ip}")

@@ -28,17 +28,25 @@ Usage:
 
 import os
 import sys
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, AIMessageChunk
+from langchain_core.tools import tool, InjectedToolCallId
 from langchain_groq import ChatGroq
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.prebuilt import create_react_agent
+from langgraph.types import interrupt, Command
+from langchain_core.runnables import RunnableConfig
+
+from engine_manager import EngineManager
+
+# Thread-local to pass the chat thread_id down to tools
+_chat_thread_local = threading.local()
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 BACKEND_DIR = Path(r"c:\Users\jassi\OneDrive\Documents\CTI_V2\Backend")
@@ -113,7 +121,11 @@ Use this when the user provides specific CVE IDs to look up.
 # ═════════════════════════════════════════════════════════════════════════════
 
 @tool
-def scan_natural_language_query(query: str) -> str:
+def scan_natural_language_query(
+    query: Annotated[str, "The natural language query describing the target"],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    config: RunnableConfig,
+) -> str:
     """Run the full CTI enumeration pipeline from a natural language query.
     
     This is the most comprehensive tool. It converts a natural language 
@@ -134,38 +146,67 @@ def scan_natural_language_query(query: str) -> str:
                Example: "Find Apache 2.4.49 servers with path traversal vulnerabilities"
     
     Returns:
-        A summary of the scan results including the Engine ID for resuming,
-        number of IPs found, CVEs extracted, and the final engine status.
+        Confirmation that the engine has been started with its thread ID.
     """
-    from Engine_query_input import run_engine as run_query_engine
+    from chat_persistence import ChatDB
 
-    engine_id = f"query_{uuid.uuid4().hex[:8]}"
+    # Step 1: Ask for human approval via LangGraph interrupt
+    human_response = interrupt({
+        "tool": "scan_natural_language_query",
+        "engine_name": "Query Engine",
+        "query": query,
+        "message": f'Run Query Engine for "{query}"?',
+    })
 
+    # If human declined, return without running
+    if human_response and human_response.get("action") == "decline":
+        return f"User declined to run Query Engine for: {query}"
+
+    # Step 2: Start engine in background (fire-and-forget)
+    engine_thread_id = f"query_{tool_call_id}"
+    
+    configurable = config.get("configurable", {})
+    chat_tid = configurable.get("thread_id")
+    msg_idx = configurable.get("assistant_msg_idx")
+    if chat_tid:
+        try:
+            db = ChatDB()
+            db.insert_tool_call(
+                chat_tid, tool_call_id, "scan_natural_language_query",
+                engine_thread_id, {"query": query}, message_index=msg_idx,
+            )
+            db.close()
+        except Exception:
+            pass
+
+    # Start engine in background thread via EngineManager
     try:
-        result = run_query_engine(query, thread_id=engine_id)
-
-        ips = result.get("ips", [])
-        cves = result.get("cve", [])
-        status = result.get("engine_status", "unknown")
-
-        summary = (
-            f"Engine ID: {engine_id}\n"
-            f"Status: {status}\n"
-            f"Query: {query}\n"
-            f"Shodan Queries Generated: {len(result.get('queries', []))}\n"
-            f"IPs Discovered: {len(ips)}\n"
-            f"IPs: {', '.join(ips[:20])}" + (" ..." if len(ips) > 20 else "") + "\n"
-            f"CVEs Extracted: {len(cves)}\n"
-            f"CVEs: {', '.join(cves[:30])}" + (" ..." if len(cves) > 30 else "")
+        mgr = EngineManager()
+        mgr.start_engine(
+            engine_type="query",
+            input_data={"query": query},
+            engine_thread_id=engine_thread_id,
+            chat_thread_id=chat_tid or "",
+            tool_call_id=tool_call_id,
         )
-        return summary
+    except RuntimeError as e:
+        return f"Cannot start engine: {str(e)}"
 
-    except Exception as e:
-        return f"Engine ID: {engine_id}\nStatus: error\nError: {str(e)}"
+    # Step 3: Return immediately — don't wait for engine
+    return (
+        f"Query Engine started in background.\n"
+        f"Engine Thread ID: {engine_thread_id}\n"
+        f"Query: {query}\n"
+        f"The user can track live progress via the engine stream."
+    )
 
 
 @tool
-def scan_ip_list(ip_addresses: list[str]) -> str:
+def scan_ip_list(
+    ip_addresses: Annotated[list[str], "List of IPv4 addresses"],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    config: RunnableConfig,
+) -> str:
     """Scan a list of IP addresses using Nmap (8-phase full-spectrum) and Shodan.
     
     Use this when the user provides specific IP addresses they want scanned.
@@ -191,35 +232,64 @@ def scan_ip_list(ip_addresses: list[str]) -> str:
                       Example: ["1.2.3.4", "5.6.7.8", "10.0.0.1"]
     
     Returns:
-        A summary including Engine ID, number of IPs scanned, and CVEs found.
+        Confirmation that the engine has been started with its thread ID.
     """
-    from Engine_ip_input import run_engine as run_ip_engine
+    from chat_persistence import ChatDB
 
-    engine_id = f"ips_{uuid.uuid4().hex[:8]}"
+    # Step 1: Ask for human approval
+    human_response = interrupt({
+        "tool": "scan_ip_list",
+        "engine_name": "IP Scanner Engine",
+        "query": f"Scan IPs: {', '.join(ip_addresses[:5])}" + (" ..." if len(ip_addresses) > 5 else ""),
+        "message": f'Run IP Scanner Engine for {len(ip_addresses)} IP(s)?',
+    })
+
+    if human_response and human_response.get("action") == "decline":
+        return f"User declined to run IP Scanner for: {', '.join(ip_addresses)}"
+
+    # Step 2: Start engine in background
+    engine_thread_id = f"ips_{tool_call_id}"
+    
+    configurable = config.get("configurable", {})
+    chat_tid = configurable.get("thread_id")
+    msg_idx = configurable.get("assistant_msg_idx")
+    if chat_tid:
+        try:
+            db = ChatDB()
+            db.insert_tool_call(
+                chat_tid, tool_call_id, "scan_ip_list",
+                engine_thread_id, {"ip_addresses": ip_addresses}, message_index=msg_idx,
+            )
+            db.close()
+        except Exception:
+            pass
 
     try:
-        result = run_ip_engine(ip_addresses, thread_id=engine_id)
-
-        ips = result.get("ips", [])
-        cves = result.get("cve", [])
-        status = result.get("engine_status", "unknown")
-
-        summary = (
-            f"Engine ID: {engine_id}\n"
-            f"Status: {status}\n"
-            f"IPs Scanned: {len(ips)}\n"
-            f"IPs: {', '.join(ips)}\n"
-            f"CVEs Extracted: {len(cves)}\n"
-            f"CVEs: {', '.join(cves[:30])}" + (" ..." if len(cves) > 30 else "")
+        mgr = EngineManager()
+        mgr.start_engine(
+            engine_type="ip",
+            input_data={"ip_addresses": ip_addresses},
+            engine_thread_id=engine_thread_id,
+            chat_thread_id=chat_tid or "",
+            tool_call_id=tool_call_id,
         )
-        return summary
+    except RuntimeError as e:
+        return f"Cannot start engine: {str(e)}"
 
-    except Exception as e:
-        return f"Engine ID: {engine_id}\nStatus: error\nError: {str(e)}"
+    return (
+        f"IP Scanner Engine started in background.\n"
+        f"Engine Thread ID: {engine_thread_id}\n"
+        f"IPs: {', '.join(ip_addresses)}\n"
+        f"The user can track live progress via the engine stream."
+    )
 
 
 @tool
-def scan_cve_list(cve_ids: list[str]) -> str:
+def scan_cve_list(
+    cve_ids: Annotated[list[str], "List of CVE identifiers"],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    config: RunnableConfig,
+) -> str:
     """Fetch NVD data and run ChatGPT MITRE ATT&CK analysis for a list of CVE IDs.
     
     Use this when the user provides specific CVE identifiers they want researched.
@@ -241,28 +311,56 @@ def scan_cve_list(cve_ids: list[str]) -> str:
                  Example: ["CVE-2024-1234", "CVE-2023-5678"]
     
     Returns:
-        A summary including Engine ID and number of CVEs processed.
+        Confirmation that the engine has been started with its thread ID.
     """
-    from Engine_cve_input import run_engine as run_cve_engine
+    from chat_persistence import ChatDB
 
-    engine_id = f"cves_{uuid.uuid4().hex[:8]}"
+    # Step 1: Ask for human approval
+    human_response = interrupt({
+        "tool": "scan_cve_list",
+        "engine_name": "CVE Research Engine",
+        "query": f"Research CVEs: {', '.join(cve_ids[:5])}" + (" ..." if len(cve_ids) > 5 else ""),
+        "message": f'Run CVE Research Engine for {len(cve_ids)} CVE(s)?',
+    })
+
+    if human_response and human_response.get("action") == "decline":
+        return f"User declined to run CVE Research for: {', '.join(cve_ids)}"
+
+    # Step 2: Start engine in background
+    engine_thread_id = f"cves_{tool_call_id}"
+    
+    configurable = config.get("configurable", {})
+    chat_tid = configurable.get("thread_id")
+    msg_idx = configurable.get("assistant_msg_idx")
+    if chat_tid:
+        try:
+            db = ChatDB()
+            db.insert_tool_call(
+                chat_tid, tool_call_id, "scan_cve_list",
+                engine_thread_id, {"cve_ids": cve_ids}, message_index=msg_idx,
+            )
+            db.close()
+        except Exception:
+            pass
 
     try:
-        result = run_cve_engine(cve_ids, thread_id=engine_id)
-
-        cves = result.get("cve", [])
-        status = result.get("engine_status", "unknown")
-
-        summary = (
-            f"Engine ID: {engine_id}\n"
-            f"Status: {status}\n"
-            f"CVEs Processed: {len(cves)}\n"
-            f"CVEs: {', '.join(cves)}"
+        mgr = EngineManager()
+        mgr.start_engine(
+            engine_type="cve",
+            input_data={"cve_ids": cve_ids},
+            engine_thread_id=engine_thread_id,
+            chat_thread_id=chat_tid or "",
+            tool_call_id=tool_call_id,
         )
-        return summary
+    except RuntimeError as e:
+        return f"Cannot start engine: {str(e)}"
 
-    except Exception as e:
-        return f"Engine ID: {engine_id}\nStatus: error\nError: {str(e)}"
+    return (
+        f"CVE Research Engine started in background.\n"
+        f"Engine Thread ID: {engine_thread_id}\n"
+        f"CVEs: {', '.join(cve_ids)}\n"
+        f"The user can track live progress via the engine stream."
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -339,10 +437,11 @@ def stream_agent(
     Stream the agent's response token-by-token and tool events.
     
     Yields dicts with:
-        {"type": "token",      "content": "partial text..."}
-        {"type": "tool_start", "tool": "scan_ip_list", "input": {...}}
-        {"type": "tool_end",   "tool": "scan_ip_list", "output": "..."}
-        {"type": "done",       "thread_id": "chat_abc123"}
+        {"type": "token",            "content": "partial text..."}
+        {"type": "tool_approval",    "tool": "...", "engine_name": "...", "query": "..."}
+        {"type": "tool_end",         "tool": "...", "output": "..."}
+        {"type": "engine_started",   "engine_thread_id": "...", "engine_name": "..."}
+        {"type": "done",             "thread_id": "chat_abc123"}
     
     Args:
         user_message: The user's text message.
@@ -354,37 +453,274 @@ def stream_agent(
     with PostgresSaver.from_conn_string(PG_CONN_STRING) as checkpointer:
         checkpointer.setup()
         agent = build_agent(checkpointer=checkpointer)
-        config = {"configurable": {"thread_id": thread_id}}
+        
+        # Get next msg_index for tool linkage
+        from chat_persistence import ChatDB
+        try:
+            db = ChatDB()
+            msg_idx = db.get_next_message_index(thread_id)
+            db.close()
+        except Exception:
+            msg_idx = 0
 
-        for event in agent.stream(
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "assistant_msg_idx": msg_idx,
+            }
+        }
+
+        caught_interrupt = False
+
+        for event_type, payload in agent.stream(
             {"messages": [HumanMessage(content=user_message)]},
             config=config,
-            stream_mode="updates",
+            stream_mode=["messages", "updates"],
         ):
-            # Agent node emits AI messages (text + tool calls)
-            if "agent" in event:
-                for msg in event["agent"].get("messages", []):
-                    if isinstance(msg, AIMessage):
-                        if msg.content:
-                            yield {"type": "token", "content": msg.content}
-                        # If the AI is calling a tool, emit tool_start
-                        for tc in (msg.tool_calls or []):
+            # 1. Handle real-time token streaming from the LLM
+            if event_type == "messages":
+                chunk, metadata = payload
+                if isinstance(chunk, AIMessageChunk):
+                    if chunk.content:
+                        yield {"type": "token", "content": chunk.content}
+
+            # 2. Handle state updates (when a node finishes)
+            elif event_type == "updates":
+                # Agent node finished (check if it decided to call tools)
+                if "agent" in payload:
+                    for msg in payload["agent"].get("messages", []):
+                        if isinstance(msg, AIMessage):
+                            for tc in (msg.tool_calls or []):
+                                yield {
+                                    "type": "tool_start",
+                                    "tool": tc["name"],
+                                    "input": tc["args"],
+                                }
+
+                # Tools node finished (returns the tool execution result)
+                if "tools" in payload:
+                    for msg in payload["tools"].get("messages", []):
+                        output = msg.content if hasattr(msg, "content") else str(msg)
+                        tool_name = getattr(msg, "name", "unknown")
+                        
+                        engine_tid = None
+                        engine_name = None
+                        if "Engine Thread ID:" in output:
+                            for line in output.split("\n"):
+                                if line.startswith("Engine Thread ID:"):
+                                    engine_tid = line.split(":", 1)[1].strip()
+                            engine_name = _get_engine_display_name(tool_name)
+                        
+                        yield {
+                            "type": "tool_end",
+                            "tool": tool_name,
+                            "output": output,
+                        }
+                        
+                        if engine_tid:
                             yield {
-                                "type": "tool_start",
-                                "tool": tc["name"],
-                                "input": tc["args"],
+                                "type": "engine_started",
+                                "engine_thread_id": engine_tid,
+                                "engine_name": engine_name or tool_name,
+                                "tool": tool_name,
                             }
 
-            # Tools node emits tool results
-            if "tools" in event:
-                for msg in event["tools"].get("messages", []):
-                    yield {
-                        "type": "tool_end",
-                        "tool": getattr(msg, "name", "unknown"),
-                        "output": msg.content if hasattr(msg, "content") else str(msg),
-                    }
+                # Handle interrupt (human-in-the-loop approval) — in-stream detection
+                if "__interrupt" in payload:
+                    for intr in payload["__interrupt"]:
+                        interrupt_value = intr.value if hasattr(intr, "value") else intr
+                        yield {
+                            "type": "tool_approval",
+                            "tool": interrupt_value.get("tool", ""),
+                            "engine_name": interrupt_value.get("engine_name", ""),
+                            "query": interrupt_value.get("query", ""),
+                            "message": interrupt_value.get("message", ""),
+                        }
+                        caught_interrupt = True
+                    if caught_interrupt:
+                        return
+
+        # ── Fallback: check graph state for pending interrupts ──────────
+        # Some LangGraph versions don't emit __interrupt in the stream.
+        # We check the actual graph state after the stream ends.
+        if not caught_interrupt:
+            try:
+                state = agent.get_state(config)
+                if state and state.next:  # Graph has pending nodes → interrupted
+                    for task in (state.tasks or []):
+                        if hasattr(task, 'interrupts') and task.interrupts:
+                            for intr in task.interrupts:
+                                interrupt_value = intr.value if hasattr(intr, 'value') else {}
+                                yield {
+                                    "type": "tool_approval",
+                                    "tool": interrupt_value.get("tool", ""),
+                                    "engine_name": interrupt_value.get("engine_name", ""),
+                                    "query": interrupt_value.get("query", ""),
+                                    "message": interrupt_value.get("message", ""),
+                                }
+                            return
+            except Exception as e:
+                print(f"[Agent] Error checking state for interrupts: {e}")
 
         yield {"type": "done", "thread_id": thread_id}
+
+
+def resume_agent(thread_id: str, human_response: dict):
+    """
+    Resume the agent after human-in-the-loop approval/decline.
+    
+    Args:
+        thread_id: The chat thread ID.
+        human_response: {"action": "accept"} or {"action": "decline"}
+    
+    Yields the same event dicts as stream_agent.
+    """
+    with PostgresSaver.from_conn_string(PG_CONN_STRING) as checkpointer:
+        checkpointer.setup()
+        agent = build_agent(checkpointer=checkpointer)
+        
+        # Get next msg_index for tool linkage (assume current msg is the last inserted)
+        from chat_persistence import ChatDB
+        try:
+            db = ChatDB()
+            msg_idx = db.get_next_message_index(thread_id) - 1
+            db.close()
+        except Exception:
+            msg_idx = 0
+            
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "assistant_msg_idx": msg_idx,
+            }
+        }
+
+        caught_interrupt = False
+
+        for event_type, payload in agent.stream(
+            Command(resume=human_response),
+            config=config,
+            stream_mode=["messages", "updates"],
+        ):
+            if event_type == "messages":
+                chunk, metadata = payload
+                if isinstance(chunk, AIMessageChunk):
+                    if chunk.content:
+                        yield {"type": "token", "content": chunk.content}
+
+            elif event_type == "updates":
+                if "agent" in payload:
+                    for msg in payload["agent"].get("messages", []):
+                        if isinstance(msg, AIMessage):
+                            for tc in (msg.tool_calls or []):
+                                yield {
+                                    "type": "tool_start",
+                                    "tool": tc["name"],
+                                    "input": tc["args"],
+                                }
+
+                if "tools" in payload:
+                    for msg in payload["tools"].get("messages", []):
+                        output = msg.content if hasattr(msg, "content") else str(msg)
+                        tool_name = getattr(msg, "name", "unknown")
+                        
+                        engine_tid = None
+                        engine_name = None
+                        if "Engine Thread ID:" in output:
+                            for line in output.split("\n"):
+                                if line.startswith("Engine Thread ID:"):
+                                    engine_tid = line.split(":", 1)[1].strip()
+                            engine_name = _get_engine_display_name(tool_name)
+                        
+                        yield {
+                            "type": "tool_end",
+                            "tool": tool_name,
+                            "output": output,
+                        }
+                        
+                        if engine_tid:
+                            yield {
+                                "type": "engine_started",
+                                "engine_thread_id": engine_tid,
+                                "engine_name": engine_name or tool_name,
+                                "tool": tool_name,
+                            }
+
+                if "__interrupt" in payload:
+                    for intr in payload["__interrupt"]:
+                        interrupt_value = intr.value if hasattr(intr, "value") else intr
+                        yield {
+                            "type": "tool_approval",
+                            "tool": interrupt_value.get("tool", ""),
+                            "engine_name": interrupt_value.get("engine_name", ""),
+                            "query": interrupt_value.get("query", ""),
+                            "message": interrupt_value.get("message", ""),
+                        }
+                        caught_interrupt = True
+                    if caught_interrupt:
+                        return
+
+        # Fallback interrupt check
+        if not caught_interrupt:
+            try:
+                state = agent.get_state(config)
+                if state and state.next:
+                    for task in (state.tasks or []):
+                        if hasattr(task, 'interrupts') and task.interrupts:
+                            for intr in task.interrupts:
+                                interrupt_value = intr.value if hasattr(intr, 'value') else {}
+                                yield {
+                                    "type": "tool_approval",
+                                    "tool": interrupt_value.get("tool", ""),
+                                    "engine_name": interrupt_value.get("engine_name", ""),
+                                    "query": interrupt_value.get("query", ""),
+                                    "message": interrupt_value.get("message", ""),
+                                }
+                            return
+            except Exception as e:
+                print(f"[Agent] Error checking state for interrupts: {e}")
+
+        yield {"type": "done", "thread_id": thread_id}
+
+
+def get_pending_approval(thread_id: str) -> dict | None:
+    """
+    Check if a chat thread has a pending interrupt (tool awaiting approval).
+    Used when frontend reloads a chat after server restart.
+    
+    Returns:
+        dict with tool/engine_name/query/message if pending, else None.
+    """
+    try:
+        with PostgresSaver.from_conn_string(PG_CONN_STRING) as checkpointer:
+            checkpointer.setup()
+            agent = build_agent(checkpointer=checkpointer)
+            config = {"configurable": {"thread_id": thread_id}}
+            state = agent.get_state(config)
+            if state and state.next:
+                for task in (state.tasks or []):
+                    if hasattr(task, 'interrupts') and task.interrupts:
+                        for intr in task.interrupts:
+                            val = intr.value if hasattr(intr, 'value') else {}
+                            return {
+                                "tool": val.get("tool", ""),
+                                "engine_name": val.get("engine_name", ""),
+                                "query": val.get("query", ""),
+                                "message": val.get("message", ""),
+                            }
+    except Exception as e:
+        print(f"[Agent] Error checking pending approval: {e}")
+    return None
+
+
+def _get_engine_display_name(tool_name: str) -> str:
+    """Map tool name to a user-friendly engine display name."""
+    mapping = {
+        "scan_natural_language_query": "Query Engine",
+        "scan_ip_list": "IP Scanner Engine",
+        "scan_cve_list": "CVE Research Engine",
+    }
+    return mapping.get(tool_name, tool_name)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -414,6 +750,27 @@ def get_chat_history(thread_id: str) -> list[dict]:
             elif isinstance(msg, AIMessage) and msg.content:
                 history.append({"role": "assistant", "content": msg.content})
         return history
+
+
+def get_pending_approval(thread_id: str) -> dict | None:
+    """
+    Check if the LangGraph state is currently interrupted waiting for user approval.
+    Returns the interrupt payload if waiting, else None.
+    """
+    with PostgresSaver.from_conn_string(PG_CONN_STRING) as checkpointer:
+        checkpointer.setup()
+        agent = build_agent(checkpointer=checkpointer)
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        state = agent.get_state(config)
+        if state and state.tasks:
+            for task in state.tasks:
+                if task.interrupts:
+                    for interrupt_payload in task.interrupts:
+                        # Assuming the payload is our dict with "tool", "engine_name", etc.
+                        if isinstance(interrupt_payload.value, dict) and "engine_name" in interrupt_payload.value:
+                            return interrupt_payload.value
+    return None
 
 
 def list_chat_sessions() -> list[str]:

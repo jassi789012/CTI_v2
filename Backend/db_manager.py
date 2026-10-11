@@ -199,6 +199,19 @@ CREATE TABLE IF NOT EXISTS cve_mitre_mappings (
 
 CREATE INDEX IF NOT EXISTS idx_cve_mitre_analysis_id  ON cve_mitre_mappings (cve_analysis_id);
 CREATE INDEX IF NOT EXISTS idx_cve_mitre_technique_id ON cve_mitre_mappings (technique_id);
+
+-- 10. Nmap scan phase checkpoints (for resume support)
+CREATE TABLE IF NOT EXISTS nmap_scan_checkpoints (
+    id               SERIAL PRIMARY KEY,
+    ip               INET NOT NULL,
+    engine_thread_id TEXT NOT NULL,
+    last_phase       INT NOT NULL,
+    state_data       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at       TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(ip, engine_thread_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nmap_cp_ip ON nmap_scan_checkpoints (ip);
 """
 
 
@@ -597,6 +610,42 @@ class DBManager:
             self.conn.rollback()
             print(f"[-] Error saving nmap scan for {ip}: {e}")
             return False
+
+    # ─── Nmap Scan Checkpoints (resume support) ──────────────────────────────
+
+    def save_nmap_checkpoint(self, ip: str, engine_thread_id: str, last_phase: int, state_data: dict):
+        """Save or update a scan checkpoint so the scan can resume after a crash."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO nmap_scan_checkpoints (ip, engine_thread_id, last_phase, state_data)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (ip, engine_thread_id) DO UPDATE
+                SET last_phase = EXCLUDED.last_phase,
+                    state_data = EXCLUDED.state_data,
+                    updated_at = NOW()
+            """, (ip, engine_thread_id, last_phase, Json(state_data)))
+        self.conn.commit()
+
+    def load_nmap_checkpoint(self, ip: str, engine_thread_id: str) -> dict | None:
+        """Load the most recent checkpoint for an IP scan. Returns None if no checkpoint."""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT last_phase, state_data FROM nmap_scan_checkpoints
+                WHERE ip = %s AND engine_thread_id = %s
+            """, (ip, engine_thread_id))
+            row = cur.fetchone()
+        if row:
+            return dict(row)
+        return None
+
+    def delete_nmap_checkpoint(self, ip: str, engine_thread_id: str):
+        """Remove checkpoint after scan completes successfully."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM nmap_scan_checkpoints
+                WHERE ip = %s AND engine_thread_id = %s
+            """, (ip, engine_thread_id))
+        self.conn.commit()
 
     # ═════════════════════════════════════════════════════════════════════════
     # Query Helpers (for agent and scripts)

@@ -1,0 +1,159 @@
+"""
+Engine Progress — Shared Progress & Cancellation System
+=========================================================
+Provides thread-safe communication between engine tools (running in
+background threads) and the SSE stream (running in the API server).
+
+The system uses:
+  - threading.local() for per-thread context (engine_id, tool_name)
+  - Thread-safe queues for progress events (keyed by chat thread_id)
+  - Threading events for cancellation signals
+
+Usage:
+    # In api_server.py — register before starting the agent
+    from engine_progress import register_chat, unregister_chat, get_progress_queue, cancel_engine
+
+    progress_q = register_chat(thread_id)
+    # ... drain progress_q in a polling loop ...
+    unregister_chat(thread_id)
+
+    # In main_agent.py tools — set context before running engine
+    from engine_progress import set_context, clear_context
+
+    set_context(chat_thread_id, engine_id, tool_name)
+    run_engine(...)
+    clear_context()
+
+    # In engine nodes — emit progress updates
+    from engine_progress import emit_progress, is_cancelled
+
+    emit_progress("query_gen", "running", "3/5 queries generated")
+    if is_cancelled():
+        raise InterruptedError("Engine cancelled by user")
+"""
+
+import threading
+import queue as queue_module
+
+# ─── Thread-local storage for engine context ─────────────────────────────────
+_local = threading.local()
+
+# ─── Global registries (thread-safe via GIL for simple dict ops) ─────────────
+_progress_queues: dict[str, queue_module.Queue] = {}
+_cancel_events: dict[str, threading.Event] = {}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Chat-level registration (called by api_server.py)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def register_chat(chat_thread_id: str) -> queue_module.Queue:
+    """Register a progress queue + cancel event for a chat session."""
+    q = queue_module.Queue()
+    _progress_queues[chat_thread_id] = q
+    _cancel_events[chat_thread_id] = threading.Event()
+    return q
+
+
+def unregister_chat(chat_thread_id: str):
+    """Clean up progress queue + cancel event for a chat session."""
+    _progress_queues.pop(chat_thread_id, None)
+    _cancel_events.pop(chat_thread_id, None)
+
+
+def get_progress_queue(chat_thread_id: str) -> queue_module.Queue | None:
+    return _progress_queues.get(chat_thread_id)
+
+
+def cancel_engine(chat_thread_id: str):
+    """Signal cancellation for any engine running in this chat."""
+    evt = _cancel_events.get(chat_thread_id)
+    if evt:
+        evt.set()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Engine-level context (called by tools in main_agent.py)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def set_context(chat_thread_id: str, engine_id: str, tool_name: str, tool_call_id: str = None):
+    """Set the engine context for the current thread.
+    
+    This must be called in the same thread that will run the engine nodes,
+    because the nodes use threading.local() to find the context.
+    """
+    _local.chat_thread_id = chat_thread_id
+    _local.engine_id = engine_id
+    _local.tool_name = tool_name
+    _local.tool_call_id = tool_call_id
+
+
+def clear_context():
+    """Clear the engine context for the current thread."""
+    _local.chat_thread_id = None
+    _local.engine_id = None
+    _local.tool_name = None
+    _local.tool_call_id = None
+
+
+def get_context() -> tuple[str | None, str | None, str | None, str | None]:
+    """Get (chat_thread_id, engine_id, tool_name, tool_call_id) for the current thread."""
+    return (
+        getattr(_local, 'chat_thread_id', None),
+        getattr(_local, 'engine_id', None),
+        getattr(_local, 'tool_name', None),
+        getattr(_local, 'tool_call_id', None),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Progress emission (called by engine nodes)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def emit_progress(node_name: str, status: str, detail: str = ""):
+    """Emit a progress event from inside an engine node.
+    
+    Pushes to:
+      1. The SSE queue (for real-time frontend updates)
+      2. The tool_calls DB table (for persistence/reload)
+    
+    Args:
+        node_name: The current node (e.g. "query_gen", "process_all_ips")
+        status:    "running" | "done"
+        detail:    Human-readable progress string (e.g. "2/5 IPs scanned")
+    """
+    chat_tid, engine_id, tool_name, tool_call_id = get_context()
+    if not chat_tid:
+        return  # No context set, probably running in CLI mode
+
+    # 1. Push to SSE queue (real-time)
+    q = _progress_queues.get(chat_tid)
+    if q:
+        q.put({
+            "type": "engine_progress",
+            "engine_id": engine_id or "",
+            "tool_name": tool_name or "",
+            "tool_call_id": tool_call_id or "",
+            "node": node_name,
+            "status": status,
+            "detail": detail,
+        })
+
+    # 2. Persist to DB (survives page reload)
+    if tool_call_id:
+        try:
+            from chat_persistence import ChatDB
+            db = ChatDB()
+            db.update_tool_progress(tool_call_id, node_name, status, detail)
+            db.close()
+        except Exception:
+            pass  # Don't let DB errors break engine execution
+
+
+def is_cancelled() -> bool:
+    """Check if the current engine has been cancelled by the user."""
+    chat_tid = getattr(_local, 'chat_thread_id', None)
+    if not chat_tid:
+        return False
+    evt = _cancel_events.get(chat_tid)
+    return evt.is_set() if evt else False

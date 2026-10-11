@@ -59,11 +59,9 @@ PG_CONN_STRING = (
 )
 
 # ─── Imports from our backend ────────────────────────────────────────────────
-from main_agent import (
-    stream_agent,
-    get_chat_history,
-    list_chat_sessions,
-)
+from main_agent import stream_agent, resume_agent, get_pending_approval
+from chat_persistence import ChatDB
+from engine_manager import EngineManager
 from db_manager import DBManager
 
 
@@ -82,14 +80,27 @@ _active_tasks: dict[str, Event] = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
-    # Startup: verify DB connection
+    # Startup: verify DB connection + init custom tables
     try:
         db = DBManager()
         db.init_tables()
         db.close()
-        print("[API] ✅ Database connection verified")
+        print("[API] OK - Data tables verified")
     except Exception as e:
-        print(f"[API] ⚠️  Database connection failed: {e}")
+        print(f"[API] ERROR - Data tables failed: {e}")
+    
+    try:
+        chat_db = ChatDB()
+        chat_db.init_tables()
+        # Mark all 'running' tool calls as 'paused' since server just started
+        # (any engine that was running before the restart is gone)
+        with chat_db.conn.cursor() as cur:
+            cur.execute("UPDATE tool_calls SET status = 'paused' WHERE status = 'running'")
+            chat_db.conn.commit()
+        chat_db.close()
+        print("[API] OK - Chat tables verified + stale tool calls cleaned")
+    except Exception as e:
+        print(f"[API] ERROR - Chat tables failed: {e}")
     
     yield
     
@@ -165,42 +176,73 @@ async def create_new_chat():
     return NewChatResponse(thread_id=thread_id)
 
 
-@app.get("/api/chats", response_model=list[ChatSession])
+@app.get("/api/chats")
 async def list_chats():
-    """List all past chat session IDs."""
-    sessions = list_chat_sessions()
-    return [ChatSession(thread_id=sid) for sid in sessions]
+    """List all chat sessions from our custom table."""
+    try:
+        db = ChatDB()
+        threads = db.list_chat_threads()
+        db.close()
+        return [{"thread_id": t["thread_id"], "created_at": t["created_at"].isoformat() if t.get("created_at") else None} for t in threads]
+    except Exception:
+        return []
 
 
-@app.get("/api/chats/{thread_id}", response_model=list[ChatHistoryMessage])
+@app.get("/api/chats/{thread_id}")
 async def get_history(thread_id: str):
-    """Get the full message history for a chat session."""
-    history = get_chat_history(thread_id)
-    return [ChatHistoryMessage(**msg) for msg in history]
+    """Get the full message history + tool calls for a chat session."""
+    try:
+        db = ChatDB()
+        messages = db.get_chat_history(thread_id)
+        tool_calls = db.get_tool_calls(thread_id)
+        db.close()
+        
+        # Serialize datetime objects
+        for msg in messages:
+            if msg.get("created_at") and hasattr(msg["created_at"], "isoformat"):
+                msg["created_at"] = msg["created_at"].isoformat()
+        for tc in tool_calls:
+            if tc.get("created_at") and hasattr(tc["created_at"], "isoformat"):
+                tc["created_at"] = tc["created_at"].isoformat()
+        
+        return {"messages": messages, "tool_calls": tool_calls}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/chats/{thread_id}")
 async def delete_chat(thread_id: str):
-    """Delete a chat session's checkpoints from the database."""
+    """Delete a chat session from custom tables + LangGraph checkpoints."""
+    from engine_progress import cancel_engine
+
+    # Stop any running agent/engine for this chat
+    cancel_event = _active_tasks.get(thread_id)
+    if cancel_event:
+        cancel_event.set()
+        cancel_engine(thread_id)
+
+    # Delete from our custom tables
+    try:
+        db = ChatDB()
+        db.delete_thread(thread_id)
+        db.close()
+    except Exception:
+        pass
+
+    # Delete from LangGraph checkpoint tables
     import psycopg2
     try:
         conn = psycopg2.connect(PG_CONN_STRING)
         with conn.cursor() as cur:
-            # Delete from all checkpoint-related tables
-            cur.execute(
-                "DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,)
-            )
-            cur.execute(
-                "DELETE FROM checkpoint_writes WHERE thread_id = %s", (thread_id,)
-            )
-            cur.execute(
-                "DELETE FROM checkpoint_blobs WHERE thread_id = %s", (thread_id,)
-            )
+            cur.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
+            cur.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (thread_id,))
+            cur.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s", (thread_id,))
         conn.commit()
         conn.close()
-        return {"status": "deleted", "thread_id": thread_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete chat: {str(e)}")
+    except Exception:
+        pass
+
+    return {"status": "deleted", "thread_id": thread_id}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -211,70 +253,345 @@ async def delete_chat(thread_id: str):
 async def send_message(thread_id: str, request: MessageRequest):
     """
     Send a message to the AI agent and stream the response via SSE.
-    
-    The stream emits JSON events:
-      - {"type": "token",      "content": "partial text..."}
-      - {"type": "tool_start", "tool": "scan_ip_list", "input": {...}}
-      - {"type": "tool_end",   "tool": "scan_ip_list", "output": "..."}
-      - {"type": "done",       "thread_id": "chat_abc123"}
-      - {"type": "error",      "message": "..."}
+    Saves every token to our custom DB in real-time.
+    Agent tools now return immediately (engines run in background).
+    If the agent calls interrupt(), this stream yields a tool_approval event and stops.
     """
     user_message = request.message
     if not user_message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    # Create a cancellation event for this thread
     cancel_event = Event()
     _active_tasks[thread_id] = cancel_event
 
-    async def event_generator():
-        """Run the agent in a background thread and yield SSE events."""
-        queue = asyncio.Queue()
-        loop = asyncio.get_event_loop()
+    # Save user message to DB
+    try:
+        db = ChatDB()
+        msg_idx = db.get_next_message_index(thread_id)
+        db.insert_user_message(thread_id, user_message, msg_idx)
+        assistant_msg_idx = msg_idx + 1
+        assistant_row_id = db.insert_assistant_message(thread_id, assistant_msg_idx)
+        db.close()
+    except Exception as e:
+        print(f"[API] Error saving user message: {e}")
+        assistant_row_id = None
+        assistant_msg_idx = 0
 
-        def _run_agent():
-            """Runs in a background thread — feeds events into the async queue."""
+    async def event_generator():
+        sse_queue = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+        agent_done = Event()
+
+        def _stream_agent():
+            from main_agent import _chat_thread_local
+            _chat_thread_local.assistant_msg_idx = assistant_msg_idx
+            got_approval_request = False
             try:
                 for event in stream_agent(user_message, thread_id=thread_id):
                     if cancel_event.is_set():
                         loop.call_soon_threadsafe(
-                            queue.put_nowait,
+                            sse_queue.put_nowait,
                             {"type": "stopped", "message": "Agent stopped by user"}
                         )
                         return
-                    loop.call_soon_threadsafe(queue.put_nowait, event)
+
+                    # Save tokens to DB as they arrive
+                    if event.get("type") == "token" and assistant_row_id:
+                        try:
+                            db = ChatDB()
+                            db.append_token(assistant_row_id, event["content"])
+                            db.close()
+                        except Exception:
+                            pass
+
+                    # When tool_approval fires, save a placeholder message
+                    # so the assistant bubble isn't blank on reload
+                    if event.get("type") == "tool_approval" and assistant_row_id:
+                        got_approval_request = True
+                        approval_text = f"I'd like to run **{event.get('engine_name', 'an engine')}** for:\n> {event.get('query', '')}"
+                        try:
+                            db = ChatDB()
+                            db.append_token(assistant_row_id, approval_text)
+                            db.close()
+                        except Exception:
+                            pass
+
+                    loop.call_soon_threadsafe(sse_queue.put_nowait, event)
             except Exception as e:
                 loop.call_soon_threadsafe(
-                    queue.put_nowait,
+                    sse_queue.put_nowait,
                     {"type": "error", "message": str(e)}
                 )
             finally:
-                # Signal that streaming is complete
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+                if assistant_row_id:
+                    try:
+                        db = ChatDB()
+                        if cancel_event.is_set():
+                            db.complete_message(assistant_row_id, "\n\n*Agent stopped by user.*")
+                        elif got_approval_request:
+                            # Don't mark as complete — the agent is paused waiting for approval
+                            db.complete_message(assistant_row_id)
+                        else:
+                            db.complete_message(assistant_row_id)
+                        db.close()
+                    except Exception:
+                        pass
+                agent_done.set()
 
-        # Start the agent in a background thread
-        agent_thread = Thread(target=_run_agent, daemon=True)
-        agent_thread.start()
+        stream_thread = Thread(target=_stream_agent, daemon=True)
+        stream_thread.start()
 
-        # Yield events from the queue as SSE
         while True:
-            event = await queue.get()
-            if event is None:
+            if agent_done.is_set() and sse_queue.empty():
                 break
-            yield {
-                "event": event.get("type", "message"),
-                "data": json.dumps(event),
-            }
+            try:
+                event = await asyncio.wait_for(sse_queue.get(), timeout=0.3)
+                yield {
+                    "event": event.get("type", "message"),
+                    "data": json.dumps(event),
+                }
+            except asyncio.TimeoutError:
+                continue
 
-        # Cleanup
+        stream_thread.join(timeout=2)
         _active_tasks.pop(thread_id, None)
 
     return EventSourceResponse(event_generator())
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Human-in-the-Loop: Approve / Decline Tool
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ApprovalRequest(BaseModel):
+    action: str  # "accept" or "decline"
+
+
+@app.post("/api/chats/{thread_id}/approve")
+async def approve_tool(thread_id: str, request: ApprovalRequest):
+    """
+    Accept or decline a pending tool approval request.
+    Resumes the LangGraph agent with the human's decision.
+    Returns an SSE stream with the agent's continuation.
+    """
+    human_response = {"action": request.action}
+
+    cancel_event = Event()
+    _active_tasks[thread_id] = cancel_event
+
+    # Get assistant row for token saving
+    try:
+        db = ChatDB()
+        assistant_row_id = db.insert_assistant_message(
+            thread_id, db.get_next_message_index(thread_id)
+        )
+        db.close()
+    except Exception:
+        assistant_row_id = None
+
+    async def event_generator():
+        sse_queue = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+        agent_done = Event()
+
+        def _resume_agent():
+            try:
+                for event in resume_agent(thread_id, human_response):
+                    if cancel_event.is_set():
+                        loop.call_soon_threadsafe(
+                            sse_queue.put_nowait,
+                            {"type": "stopped", "message": "Agent stopped by user"}
+                        )
+                        return
+
+                    if event.get("type") == "token" and assistant_row_id:
+                        try:
+                            db = ChatDB()
+                            db.append_token(assistant_row_id, event["content"])
+                            db.close()
+                        except Exception:
+                            pass
+
+                    loop.call_soon_threadsafe(sse_queue.put_nowait, event)
+            except Exception as e:
+                loop.call_soon_threadsafe(
+                    sse_queue.put_nowait,
+                    {"type": "error", "message": str(e)}
+                )
+            finally:
+                if assistant_row_id:
+                    try:
+                        db = ChatDB()
+                        db.complete_message(assistant_row_id)
+                        db.close()
+                    except Exception:
+                        pass
+                agent_done.set()
+
+        stream_thread = Thread(target=_resume_agent, daemon=True)
+        stream_thread.start()
+
+        while True:
+            if agent_done.is_set() and sse_queue.empty():
+                break
+            try:
+                event = await asyncio.wait_for(sse_queue.get(), timeout=0.3)
+                yield {
+                    "event": event.get("type", "message"),
+                    "data": json.dumps(event),
+                }
+            except asyncio.TimeoutError:
+                continue
+
+        stream_thread.join(timeout=2)
+        _active_tasks.pop(thread_id, None)
+
+    return EventSourceResponse(event_generator())
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Engine Live Progress (SSE) + Controls
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/engine/{engine_thread_id}/stream")
+async def stream_engine(engine_thread_id: str):
+    """
+    SSE stream of live progress for a running engine.
+    The frontend connects to this after receiving an engine_started event.
+    """
+    import queue as queue_module
+
+    mgr = EngineManager()
+    record = mgr.get_record(engine_thread_id)
+
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Engine '{engine_thread_id}' not found")
+
+    async def event_generator():
+        progress_q = record.progress_queue
+        while True:
+            # First, drain any available items from the queue
+            got_item = False
+            while not progress_q.empty():
+                try:
+                    progress = progress_q.get_nowait()
+                    got_item = True
+                    yield {
+                        "event": progress.get("type", "engine_progress"),
+                        "data": json.dumps(progress),
+                    }
+                    # If this was a terminal event, stop
+                    if progress.get("type") in ("engine_done", "engine_paused", "engine_error"):
+                        return
+                except queue_module.Empty:
+                    break
+
+            # Check if engine is done (after draining queue)
+            if record.status in ("done", "error", "paused"):
+                return
+
+            # Wait for next item with timeout
+            try:
+                progress = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: progress_q.get(timeout=1.0)
+                )
+                yield {
+                    "event": progress.get("type", "engine_progress"),
+                    "data": json.dumps(progress),
+                }
+                if progress.get("type") in ("engine_done", "engine_paused", "engine_error"):
+                    return
+            except queue_module.Empty:
+                # Send heartbeat to keep connection alive
+                yield {"event": "heartbeat", "data": "{}"}
+
+    return EventSourceResponse(event_generator())
+
+
+@app.post("/api/engine/{engine_thread_id}/stop")
+async def stop_engine(engine_thread_id: str):
+    """Pause a running engine."""
+    from engine_progress import cancel_engine as ep_cancel
+
+    mgr = EngineManager()
+    record = mgr.get_record(engine_thread_id)
+
+    if record:
+        # Signal via EngineManager (sets record.cancel_event)
+        mgr.pause_engine(engine_thread_id)
+        # Also signal via engine_progress (sets _cancel_events for the chat)
+        ep_cancel(record.chat_thread_id)
+    
+    return {"status": "pausing", "engine_thread_id": engine_thread_id}
+
+
+@app.post("/api/engine/{engine_thread_id}/resume")
+async def resume_engine_endpoint(engine_thread_id: str):
+    """
+    Resume a paused engine. Returns the new SSE stream endpoint.
+    """
+    mgr = EngineManager()
+    # Find the chat_thread_id from DB
+    try:
+        db = ChatDB()
+        with db.conn.cursor() as cur:
+            cur.execute(
+                "SELECT thread_id FROM tool_calls WHERE engine_thread_id = %s LIMIT 1",
+                (engine_thread_id,),
+            )
+            row = cur.fetchone()
+        db.close()
+        chat_thread_id = row[0] if row else None
+    except Exception:
+        chat_thread_id = None
+
+    if not chat_thread_id:
+        raise HTTPException(status_code=404, detail="Engine not found in database")
+
+    record = mgr.resume_engine(engine_thread_id, chat_thread_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Could not resume engine")
+
+    return {
+        "status": "resumed",
+        "engine_thread_id": engine_thread_id,
+        "stream_url": f"/api/engine/{engine_thread_id}/stream",
+    }
+
+
+@app.get("/api/chats/{thread_id}/engines")
+async def list_chat_engines(thread_id: str):
+    """
+    List all engine runs for a chat, with their current status.
+    Also checks LangGraph agent state for pending approval interrupts.
+    Used by frontend on chat open to check for running/paused engines.
+    """
+    mgr = EngineManager()
+    engines = mgr.list_engines_for_chat(thread_id)
+
+    # Serialize datetimes
+    for eng in engines:
+        if eng.get("created_at") and hasattr(eng["created_at"], "isoformat"):
+            eng["created_at"] = eng["created_at"].isoformat()
+
+    # Check if any engine is currently running in memory
+    running_engine = mgr.get_running_engine(thread_id)
+
+    # Check if there's a pending tool approval in LangGraph state
+    # (e.g., server restarted while waiting for human to accept/decline)
+    pending_approval = get_pending_approval(thread_id)
+
+    return {
+        "engines": engines,
+        "has_running": running_engine is not None,
+        "running_engine_thread_id": running_engine.engine_thread_id if running_engine else None,
+        "pending_approval": pending_approval,
+    }
+
+
 @app.post("/api/chats/{thread_id}/stop")
 async def stop_agent(thread_id: str):
-    """Stop a currently running agent/engine for the given thread."""
+    """Stop a currently running agent for the given thread."""
     cancel_event = _active_tasks.get(thread_id)
     if cancel_event:
         cancel_event.set()

@@ -48,15 +48,12 @@ CTI_V2/
 │   ├── Engine_ip_input.py        # LangGraph engine (Direct IPs → Scans → CVEs)
 │   ├── db_manager.py             # PostgreSQL database manager (schema, CRUD)
 │   │
-│   ├── api_server.py             # FastAPI server (REST + SSE streaming)
-│   ├── main_agent.py             # LangChain ReAct agent integrating all tools
 │   ├── def_Shodan/               # Shodan scraping module (get_ip, get_ip_info)
 │   ├── def_nmap/                 # Nmap concurrent scanning module
 │   ├── cve_maper/                # CVE mapping (NVD + ChatGPT automation)
 │   └── query_gen/                # AI-powered query generation (Groq API)
 │
-└── Frontend/
-    └── Chatbot/                  # React + Vite web UI for the CTI Agent
+└── src/                          # Future: frontend / API layer
 ```
 
 ---
@@ -235,25 +232,6 @@ python Engine_ip_input.py
 
 This will bypass query generation and go straight to scanning the IPs provided via CLI.
 
-### Start the Chatbot UI and API
-
-The easiest way to use the platform is via the React frontend and FastAPI backend.
-
-**Terminal 1 — Start the Backend API**
-```bash
-cd Backend
-uv run python api_server.py
-```
-This starts the FastAPI server at `http://localhost:8000`. You can view the API documentation at `http://localhost:8000/docs`.
-
-**Terminal 2 — Start the Frontend UI**
-```bash
-cd Frontend/Chatbot
-npm install  # First time only
-npm run dev
-```
-This starts the Vite development server. Open your browser to `http://localhost:5173` to chat with the CTI Agent.
-
 ### Verify Database (Optional)
 
 Run the self-test to confirm PostgreSQL is connected and tables are working:
@@ -348,9 +326,9 @@ hosts (1) ──→ (N) scans (1) ──→ (N) ports (1) ──→ (N) vulnerab
 - [x] **CVE Mapper** — Enrich vulnerability data with NVD/MITRE details (`cve_maper/`)
 - [x] **Query Generator** — AI-powered Shodan/Nmap query generation (`query_gen/`)
 - [x] **LangGraph Engine** — Graph-based agent pipelines with PostgreSQL state persistence.
-- [x] **AI Agent** — LangChain ReAct agent integrating all tools for natural language threat analysis
-- [x] **API Layer** — FastAPI server with SSE streaming for live agent communication
-- [x] **Frontend Dashboard** — React + Vite Chatbot UI for interacting with the agent
+- [ ] **AI Agent** — Connect an LLM agent to the database for natural language threat analysis
+- [ ] **Frontend Dashboard** — Web UI for visualizing collected intelligence (`src/`)
+- [ ] **API Layer** — REST API for programmatic access to CTI data
 
 ---
 

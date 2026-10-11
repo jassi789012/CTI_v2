@@ -445,13 +445,71 @@ Return JSON in exactly this structure inside a ```json code block:
 # ChatGPT Browser Automation (Persistent Profile Based)
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Selectors (verified against live ChatGPT DOM)
-_PROMPT_SELECTOR = "#prompt-textarea"
-_SEND_BUTTON_SELECTOR = '#composer-submit-button, button[data-testid="send-button"], button[aria-label="Send prompt"]'
+# ─── Selectors (updated for 2026 ChatGPT DOM) ────────────────────────────────
+# ChatGPT frequently changes its DOM. We use multiple fallback selectors
+# and prefer role/placeholder-based selectors over brittle IDs.
+
+# Prompt input: ChatGPT may use a <textarea>, a contenteditable <div>, or
+# a ProseMirror editor. We try the known ID first, then fall back to
+# role-based and placeholder-based selectors.
+_PROMPT_SELECTORS = [
+    "#prompt-textarea",                              # Classic textarea ID
+    'div[contenteditable="true"][id="prompt-textarea"]',  # Contenteditable variant
+    'div.ProseMirror[contenteditable="true"]',        # ProseMirror editor
+    '[data-testid="composer-input"]',                # Test ID variant
+]
+_PROMPT_SELECTOR = "#prompt-textarea"  # Legacy compat — used in some places
+
+# Send button: multiple fallback selectors
+_SEND_BUTTON_SELECTORS = [
+    '#composer-submit-button',
+    'button[data-testid="send-button"]',
+    'button[aria-label="Send prompt"]',
+    'button[aria-label="Send"]',
+]
+_SEND_BUTTON_SELECTOR = ', '.join(_SEND_BUTTON_SELECTORS)
+
+# Assistant message containers
+_ASSISTANT_SELECTORS = [
+    '[data-message-author-role="assistant"]',
+    'div[data-message-author-role="assistant"]',
+    'article[data-testid*="conversation-turn"] div.agent-turn',
+]
 _ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
-_STOP_BUTTON_SELECTOR = 'button[aria-label="Stop generating"]'
+
+# Stop / streaming buttons
+_STOP_BUTTON_SELECTOR = (
+    'button[data-testid="stop-button"], '
+    'button[aria-label="Stop generating"], '
+    'button[aria-label="Stop streaming"]'
+)
+
+# Login/signup buttons — ONLY the ones in the TOP HEADER area.
+# ChatGPT now shows a "Log in" prompt in the sidebar even to non-logged-in
+# users, alongside the prompt textarea. We must NOT match that sidebar CTA.
+# The header buttons are the reliable signal for "not logged in".
+_HEADER_LOGIN_SELECTORS = [
+    # Top-right header buttons (the primary login/signup action area)
+    'nav button:has-text("Log in")',
+    'header button:has-text("Log in")',
+    'div[class*="header"] button:has-text("Log in")',
+    # The "Sign up for free" button is always in the header
+    'button:has-text("Sign up for free")',
+    'a:has-text("Sign up for free")',
+]
+# Keeping old names for backward compat but they now check the header
 _LOGIN_BUTTON_SELECTOR = 'button:has-text("Log in")'
 _SIGNUP_BUTTON_SELECTOR = 'button:has-text("Sign up for free")'
+
+# Indicators that the user IS authenticated (these never appear when logged out)
+_LOGGED_IN_INDICATORS = [
+    'button[data-testid="profile-button"]',       # User avatar / profile button
+    'nav button[aria-label*="menu" i]',            # User menu
+    'button[aria-label="Open sidebar"]',           # Sidebar toggle (only for logged-in)
+    'img[alt="User"]',                              # User avatar image
+    'div[data-testid="user-menu"]',                # User menu container
+    '[data-testid="history"]',                     # Chat history panel
+]
 
 # Placeholder texts ChatGPT shows while thinking
 _PLACEHOLDER_TEXTS = {
@@ -478,33 +536,134 @@ _ACCOUNTS_DIR = Path(__file__).resolve().parent / ".accounts"
 _ACCOUNTS_FILE = _ACCOUNTS_DIR / "accounts.json"
 
 
-def _has_login_buttons(page) -> bool:
-    """Return True if login/signup buttons are visible (= NOT logged in)."""
+def _find_prompt_element(page, timeout_ms: int = 5000):
+    """Find the prompt input element using multiple fallback selectors.
+
+    Returns the element handle, or None if not found.
+    """
+    for sel in _PROMPT_SELECTORS:
+        try:
+            el = page.wait_for_selector(sel, timeout=timeout_ms)
+            if el and el.is_visible():
+                return el
+        except Exception:
+            continue
+
+    # Last resort: find by placeholder text
     try:
-        for sel in [_LOGIN_BUTTON_SELECTOR, _SIGNUP_BUTTON_SELECTOR]:
-            loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                return True
+        el = page.locator('[placeholder*="ChatGPT" i], [placeholder*="Message" i]').first
+        if el.count() > 0 and el.is_visible():
+            return el.element_handle()
+    except Exception:
+        pass
+
+    return None
+
+
+def _has_header_login_buttons(page) -> bool:
+    """Return True if the TOP HEADER 'Log in' or 'Sign up' buttons are visible.
+
+    This specifically avoids matching the sidebar "Log in" CTA that ChatGPT
+    now shows to everyone (even on the logged-out home page alongside the
+    prompt textarea).
+    """
+    try:
+        for sel in _HEADER_LOGIN_SELECTORS:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    return True
+            except Exception:
+                continue
     except Exception:
         pass
     return False
 
 
-def _is_logged_in(page, timeout_ms: int = 5000) -> bool:
-    """Return True if the user is genuinely authenticated."""
+# Keep old name for backward compat
+def _has_login_buttons(page) -> bool:
+    """Return True if login/signup buttons are visible (= NOT logged in).
+
+    Updated to check HEADER buttons, not sidebar CTAs.
+    """
+    return _has_header_login_buttons(page)
+
+
+def _has_logged_in_indicators(page) -> bool:
+    """Return True if any logged-in-only UI elements are present."""
+    for sel in _LOGGED_IN_INDICATORS:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_logged_in(page, timeout_ms: int = 8000) -> bool:
+    """Return True if the user is genuinely authenticated.
+
+    Uses a multi-signal approach:
+      1. If header 'Log in' / 'Sign up' buttons are visible → NOT logged in
+      2. If logged-in-only indicators (profile button, history) exist → logged in
+      3. If the prompt textarea is found AND no header login buttons → logged in
+      4. Extra wait + re-check for slow page loads
+
+    ChatGPT now shows the prompt textarea to EVERYONE (even logged-out users),
+    so we can't rely on the textarea alone as proof of authentication.
+    """
     try:
         if "chatgpt.com" not in page.url.lower():
             return False
-        if _has_login_buttons(page):
+
+        # Wait for page to settle
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+        page.wait_for_timeout(2000)  # Extra settle time for SPAs
+
+        # Signal 1: Header login/signup buttons visible = definitely NOT logged in
+        if _has_header_login_buttons(page):
+            print("[login-check] Header login buttons found → not logged in")
             return False
-        try:
-            prompt = page.wait_for_selector(_PROMPT_SELECTOR, timeout=timeout_ms)
-            if prompt and prompt.is_visible() and not _has_login_buttons(page):
+
+        # Signal 2: Logged-in indicators present = definitely logged in
+        if _has_logged_in_indicators(page):
+            print("[login-check] Logged-in indicators found → authenticated")
+            return True
+
+        # Signal 3: Prompt textarea visible + no header login buttons
+        prompt = _find_prompt_element(page, timeout_ms=timeout_ms)
+        if prompt:
+            # Double-check that login buttons didn't just appear
+            if not _has_header_login_buttons(page):
+                # Check if there's a sidebar login CTA (the "Get responses
+                # tailored to you... Log in" section). If that's the ONLY
+                # login indicator, we're NOT logged in.
+                try:
+                    sidebar_login = page.locator(
+                        'text="Get responses tailored to you"'
+                    )
+                    if sidebar_login.count() > 0 and sidebar_login.first.is_visible():
+                        print("[login-check] Sidebar login CTA found → not logged in")
+                        return False
+                except Exception:
+                    pass
+
+                print("[login-check] Prompt found, no login buttons → authenticated")
                 return True
-        except Exception:
-            pass
-    except Exception:
-        pass
+
+        # Signal 4: Last resort — wait a bit more and re-check
+        page.wait_for_timeout(3000)
+        if _has_logged_in_indicators(page):
+            print("[login-check] (retry) Logged-in indicators found → authenticated")
+            return True
+        if _has_header_login_buttons(page):
+            print("[login-check] (retry) Header login buttons found → not logged in")
+            return False
+
+    except Exception as e:
+        print(f"[login-check] Error: {e}")
+
     return False
 
 
@@ -593,49 +752,68 @@ class ChatGPTSession:
         page = self._page
 
         try:
-            # ── Open new chat ────────────────────────────────────────────
-            # Keyboard shortcut (Ctrl+Shift+O) is the most reliable method
-            print(f"    [ChatGPT] Opening new chat (Ctrl+Shift+O)...")
-            page.keyboard.press("Control+Shift+o")
-            page.wait_for_timeout(700)
-
-            # Wait for prompt textarea in the fresh chat
-            try:
-                page.wait_for_selector(_PROMPT_SELECTOR, timeout=3000)
-            except Exception:
-                # Shortcut didn't work — fallback to URL navigation
-                print(f"    [ChatGPT] Shortcut failed, navigating via URL...")
+            # ── Ensure fresh chat ─────────────────────────────────────────
+            # If we are already on a conversation URL (/c/...) or messages exist in the view,
+            # navigate to the fresh chat root so messages don't accumulate.
+            needs_nav = "/c/" in page.url or len(self._find_assistant_messages()) > 0
+            if needs_nav:
+                print(f"    [ChatGPT] Opening fresh chat...")
+                navigated = False
                 try:
-                    page.goto(CHATGPT_URL, wait_until="commit", timeout=30000)
-                    page.wait_for_selector(_PROMPT_SELECTOR, timeout=5000)
+                    new_btn = page.locator(
+                        'a[href="/"], button[aria-label="New chat"], '
+                        'a[data-testid="create-new-chat-button"]'
+                    ).first
+                    if new_btn.count() > 0 and new_btn.is_visible():
+                        new_btn.click()
+                        page.wait_for_timeout(1500)
+                        if "/c/" not in page.url and len(self._find_assistant_messages()) == 0:
+                            navigated = True
                 except Exception:
-                    if _has_login_buttons(page):
-                        print(f"    [ChatGPT] Session expired!")
-                        return "RATE_LIMITED"
-                    if _detect_rate_limit(page):
-                        return "RATE_LIMITED"
-                    print(f"    [ChatGPT] Prompt textarea not found!")
-                    return None
+                    pass
+
+                if not navigated:
+                    try:
+                        page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(2000)
+                    except Exception as e:
+                        print(f"    [ChatGPT] Navigation notice: {e}")
+
+            # Wait for prompt input
+            prompt_el = _find_prompt_element(page, timeout_ms=8000)
+            if not prompt_el:
+                if _has_login_buttons(page):
+                    print(f"    [ChatGPT] Session expired!")
+                    return "RATE_LIMITED"
+                if _detect_rate_limit(page):
+                    return "RATE_LIMITED"
+                print(f"    [ChatGPT] Prompt input not found!")
+                return None
 
             # Count existing assistant messages (to detect NEW ones later)
-            existing_msgs = page.query_selector_all(_ASSISTANT_SELECTOR)
+            existing_msgs = self._find_assistant_messages()
             pre_count = len(existing_msgs)
 
             # ── Paste the prompt ─────────────────────────────────────────
-            # ChatGPT converts large pastes (>~5000 chars) into file
-            # attachments. To avoid this, paste in small chunks.
             CHUNK_SIZE = 3000
             print(f"    [ChatGPT] Pasting prompt ({len(prompt)} chars"
                   f"{', chunked' if len(prompt) > CHUNK_SIZE else ''})...")
-            page.click(_PROMPT_SELECTOR, timeout=3000, force=True)
+
+            # Focus the prompt input
+            try:
+                prompt_el.click(force=True)
+            except Exception:
+                try:
+                    prompt_el.focus()
+                except Exception:
+                    pass
+            page.wait_for_timeout(300)
 
             if len(prompt) <= CHUNK_SIZE:
-                # Small prompt — single paste
                 page.evaluate("text => navigator.clipboard.writeText(text)", prompt)
                 page.keyboard.press("Control+v")
                 page.wait_for_timeout(500)
             else:
-                # Large prompt — paste in chunks to avoid file-attachment
                 chunks = [prompt[i:i + CHUNK_SIZE]
                           for i in range(0, len(prompt), CHUNK_SIZE)]
                 for idx, chunk in enumerate(chunks):
@@ -643,43 +821,54 @@ class ChatGPTSession:
                         "text => navigator.clipboard.writeText(text)", chunk
                     )
                     page.keyboard.press("Control+v")
-                    page.wait_for_timeout(300)  # brief pause between chunks
+                    page.wait_for_timeout(300)
                 print(f"    [ChatGPT] Pasted in {len(chunks)} chunks.")
 
-            # Give the UI a moment to enable the send button after pasting
-            page.wait_for_timeout(1000)
+            # Give UI a moment to register input and enable send button
+            page.wait_for_timeout(1500)
 
             # ── Click Send ───────────────────────────────────────────────
+            send_btn = self._find_send_button()
+            if not send_btn:
+                if _detect_rate_limit(page):
+                    return "RATE_LIMITED"
+                print(f"    [ChatGPT] Send button not found!")
+                return "RATE_LIMITED"
+
             # Check if send button is disabled (= message limit reached)
             try:
-                send_btn = page.locator(_SEND_BUTTON_SELECTOR).first
-                if send_btn.count() > 0:
-                    is_disabled = send_btn.get_attribute("disabled") is not None
-                    aria_disabled = send_btn.get_attribute("aria-disabled")
-                    
-                    if is_disabled or aria_disabled == "true":
-                        print(f"    [ChatGPT] Send button is DISABLED "
-                              f"— message limit reached!")
-                        return "RATE_LIMITED"
+                is_disabled = send_btn.get_attribute("disabled") is not None
+                aria_disabled = send_btn.get_attribute("aria-disabled")
+                if is_disabled or aria_disabled == "true":
+                    print(f"    [ChatGPT] Send button is DISABLED — message limit reached!")
+                    return "RATE_LIMITED"
             except Exception:
                 pass
 
+            sent = False
             try:
-                page.click(_SEND_BUTTON_SELECTOR, timeout=3000, force=True)
+                send_btn.click(force=True)
+                sent = True
                 print(f"    [ChatGPT] Send button clicked.")
             except Exception:
-                if _detect_rate_limit(page):
-                    return "RATE_LIMITED"
+                pass
+
+            if not sent:
                 try:
-                    btn = page.locator(_SEND_BUTTON_SELECTOR).first
-                    if btn.count() > 0 and btn.get_attribute("disabled") is not None:
-                        print(f"    [ChatGPT] Send button disabled "
-                              f"— message limit reached!")
-                        return "RATE_LIMITED"
+                    page.keyboard.press("Enter")
+                    sent = True
+                    print(f"    [ChatGPT] Sent via Enter key.")
                 except Exception:
                     pass
-                print(f"    [ChatGPT] Send button disabled or missing!")
+
+            if not sent:
+                if _detect_rate_limit(page):
+                    return "RATE_LIMITED"
+                print(f"    [ChatGPT] Could not send prompt!")
                 return "RATE_LIMITED"
+
+            # Wait briefly for ChatGPT to register the prompt and begin generation
+            page.wait_for_timeout(2000)
 
             # ── Wait for full response ───────────────────────────────────
             response_text = self._wait_for_new_response(pre_count)
@@ -691,55 +880,220 @@ class ChatGPTSession:
             traceback.print_exc()
             return None
 
+    def _find_send_button(self):
+        """Find the send button using multiple fallback selectors."""
+        page = self._page
+        for sel in _SEND_BUTTON_SELECTORS:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    return loc.first.element_handle()
+            except Exception:
+                continue
+
+        # Last resort: find by aria-label containing 'send' (case-insensitive)
+        try:
+            loc = page.locator('button[aria-label*="end" i]')
+            if loc.count() > 0 and loc.first.is_visible():
+                return loc.first.element_handle()
+        except Exception:
+            pass
+
+        return None
+
+    def _find_assistant_messages(self) -> list:
+        """Find all assistant message elements using multiple selectors.
+
+        Ensures user message turns are excluded.
+        """
+        page = self._page
+
+        # 1. Primary selectors — attribute-based (most reliable historically)
+        primary_selectors = [
+            '[data-message-author-role="assistant"]',
+            'div[data-message-author-role="assistant"]',
+            'article[data-message-author-role="assistant"]',
+        ]
+        for sel in primary_selectors:
+            try:
+                elements = page.query_selector_all(sel)
+                if elements:
+                    return elements
+            except Exception:
+                continue
+
+        # 2. Secondary selectors — structure/button-based
+        # (Only assistant messages have Copy response/code buttons or agent-turn class)
+        secondary_selectors = [
+            'article:has(button[aria-label*="Copy" i])',
+            'div.agent-turn',
+            'div[class*="agent-turn"]',
+        ]
+        for sel in secondary_selectors:
+            try:
+                elements = page.query_selector_all(sel)
+                if elements:
+                    return elements
+            except Exception:
+                continue
+
+        # 3. Filtered turns: check turns that are NOT user messages
+        try:
+            turns = page.query_selector_all('article[data-testid*="conversation-turn"]')
+            assistant_turns = []
+            for turn in turns:
+                try:
+                    if turn.query_selector('[data-message-author-role="user"]'):
+                        continue
+                    if (turn.query_selector('.markdown, pre, div.prose, button[aria-label*="Copy" i]')
+                            or turn.query_selector('[data-message-author-role="assistant"]')):
+                        assistant_turns.append(turn)
+                except Exception:
+                    continue
+            if assistant_turns:
+                return assistant_turns
+        except Exception:
+            pass
+
+        return []
+
+    def _is_generating(self) -> bool:
+        """Check if ChatGPT is actively generating/streaming a response."""
+        page = self._page
+        stop_selectors = [
+            'button[data-testid="stop-button"]',
+            'button[aria-label="Stop generating"]',
+            'button[aria-label="Stop streaming"]',
+        ]
+        for sel in stop_selectors:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _has_copy_button(self) -> bool:
+        """Check if a Copy button is visible (indicates response completion)."""
+        page = self._page
+        copy_selectors = [
+            'button[aria-label="Copy response"]',
+            'button[aria-label="Copy code"]',
+            'button[data-testid*="copy" i]',
+            'button[aria-label="Copy"]',
+        ]
+        for sel in copy_selectors:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _dump_dom_debug(self):
+        """Log diagnostic information about the page DOM."""
+        page = self._page
+        print("    [DEBUG] === DOM Diagnostic Dump ===")
+        checks = [
+            ('[data-message-author-role]', 'data-message-author-role elements'),
+            ('[data-message-id]', 'data-message-id elements'),
+            ('article', 'article elements'),
+            ('div.agent-turn', 'agent-turn divs'),
+            ('div[class*="agent"]', 'agent class divs'),
+            ('div.markdown', 'markdown divs'),
+            ('div.prose', 'prose divs'),
+            ('pre code', 'code blocks'),
+            ('pre', 'pre blocks'),
+            ('button[aria-label*="Copy" i]', 'Copy buttons'),
+            ('button[data-testid="stop-button"]', 'Stop testid button'),
+            ('button[aria-label="Stop generating"]', 'Stop generating button'),
+        ]
+        for selector, label in checks:
+            try:
+                count = len(page.query_selector_all(selector))
+                if count > 0:
+                    print(f"    [DEBUG]   ✓ {label}: {count}")
+            except Exception:
+                pass
+        print("    [DEBUG] === End Diagnostic Dump ===")
+
     def _wait_for_new_response(self, prev_count: int) -> str:
         """
         Wait for a NEW assistant message and for it to fully complete.
-        Uses a robust polling strategy to ensure the JSON is fully parsed.
+        Extracts clean JSON as soon as generation finishes or valid JSON is stable.
         """
         page = self._page
-        print(f"    [ChatGPT] Waiting for response to complete (prev msgs: {prev_count})...")
+        print(f"    [ChatGPT] Waiting for response to start (prev msgs: {prev_count})...")
 
-        # Step 1: Wait for response element to appear
-        deadline = time.time() + 90
+        # Step 1: Wait for response element to appear OR stop button to indicate generating
+        deadline = time.time() + 60
         found = False
         while time.time() < deadline:
-            elements = page.query_selector_all(_ASSISTANT_SELECTOR)
+            elements = self._find_assistant_messages()
             if elements and len(elements) > prev_count:
                 found = True
-                print(f"    [ChatGPT] Response element appeared...")
+                print(f"    [ChatGPT] Response element appeared ({len(elements)} msgs)...")
                 break
+
+            # If stop button is visible, generation has definitely started!
+            if self._is_generating():
+                found = True
+                print(f"    [ChatGPT] Response generation in progress (stop button active)...")
+                break
+
+            # Fallback: check if any code block appeared on page
+            try:
+                if page.locator("pre code, pre").count() > 0:
+                    found = True
+                    print(f"    [ChatGPT] Code block detected on page...")
+                    break
+            except Exception:
+                pass
+
             time.sleep(1)
 
         if not found:
             if _detect_rate_limit(page):
                 return "RATE_LIMITED"
-            print(f"    [ChatGPT] No response appeared after 90s!")
+
+            print(f"    [ChatGPT] No response element detected in 60s. Trying fallback extraction...")
+            fallback_text = self._extract_response_fallback()
+            if fallback_text and len(fallback_text) > 100:
+                print(f"    [ChatGPT] Fallback extraction got {len(fallback_text)} chars")
+                return fallback_text
+
+            print(f"    [ChatGPT] No response appeared after 60s!")
             return None
 
-        # Step 2: Poll until generation stops AND JSON is complete
-        # We consider it done when text stops changing for a while, and it looks like complete JSON.
+        # Step 2: Poll until generation stops AND JSON is extracted
         max_time = time.time() + 180  # Max 3 minutes generation
         stable_count = 0
         prev_len = 0
-        final_text = ""
+        poll_num = 0
 
         while time.time() < max_time:
             time.sleep(2)
+            poll_num += 1
+
+            # 1. Extract current text
             current_text = self._extract_response_text(prev_count)
-            
             if not current_text:
-                continue
-                
-            # If text length is same as before, increment stability counter
-            if len(current_text) == prev_len:
+                current_text = self._extract_response_fallback()
+
+            # 2. Track text length stability
+            curr_len = len(current_text) if current_text else 0
+            if curr_len > 0 and curr_len == prev_len:
                 stable_count += 1
             else:
                 stable_count = 0
-                prev_len = len(current_text)
+                prev_len = curr_len
+                if poll_num % 5 == 0 and curr_len > 0:
+                    print(f"    [ChatGPT] Poll #{poll_num}: text streaming ({curr_len} chars)...")
 
-            # Check if there is a "Continue generating" button
+            # 3. Check for "Continue generating" button
             try:
-                # ChatGPT sometimes pauses on long outputs
                 continue_btn = page.locator("button:has-text('Continue generating')")
                 if continue_btn.count() > 0 and continue_btn.first.is_visible():
                     print(f"    [ChatGPT] Clicking 'Continue generating'...")
@@ -749,93 +1103,140 @@ class ChatGPTSession:
                     continue
             except Exception:
                 pass
-                
-            # Check if stop generating button is gone
-            is_generating = False
-            try:
-                stop_btn = page.locator(_STOP_BUTTON_SELECTOR).first
-                is_generating = stop_btn.count() > 0 and stop_btn.is_visible()
-            except Exception:
-                pass
 
-            # Condition for being done:
-            # Not explicitly generating, AND text is stable for 4 seconds (2 loops)
-            if not is_generating and stable_count >= 2:
-                # If it looks like JSON, make sure it's complete
-                if _looks_like_json(current_text):
-                    if _json_looks_complete(current_text):
-                        print(f"    [ChatGPT] JSON response complete ({len(current_text)} chars)")
-                        final_text = current_text
-                        break
-                    else:
-                        # Sometimes the text takes longer to render fully into the DOM
-                        if stable_count >= 6:  # 12 seconds stable but still incomplete JSON
-                            print(f"    [ChatGPT] Response stalled incomplete. Extracting as is.")
-                            final_text = current_text
-                            break
-                        elif stable_count % 3 == 0:
-                            print(f"    [ChatGPT] Waiting for JSON to complete... (len: {len(current_text)})")
-                else:
-                    # Non-JSON response, just return it
-                    print(f"    [ChatGPT] Non-JSON response stable ({len(current_text)} chars)")
-                    final_text = current_text
-                    break
+            # 4. Check status indicators
+            is_generating = self._is_generating()
+            has_copy = self._has_copy_button()
 
-        if not final_text:
-            final_text = self._extract_response_text(prev_count)
+            # 5. Quick validation: if we already have valid parseable JSON
+            if current_text and curr_len > 150:
+                parsed = parse_chatgpt_response(current_text)
+                if parsed and validate_chatgpt_response(parsed):
+                    # If stop button is gone OR copy button is present OR text is stable:
+                    if not is_generating or has_copy or stable_count >= 2:
+                        print(f"    [ChatGPT] Valid complete JSON captured ({curr_len} chars)!")
+                        return current_text
 
-        if not final_text:
-            return None
+            # 6. If generation finished (stop button gone) and text is stable
+            if not is_generating and stable_count >= 2 and current_text and curr_len > 50:
+                print(f"    [ChatGPT] Generation finished & text stable ({curr_len} chars)")
+                return current_text
 
-        # Safety check — if still a placeholder, something went wrong
-        if final_text.lower() in _PLACEHOLDER_TEXTS or len(final_text) < 50:
-            print(f"    [ChatGPT] Response too short ({len(final_text)} chars), likely a placeholder.")
-            return None
+            # 7. If Copy button appeared and text is stable
+            if has_copy and stable_count >= 1 and current_text and curr_len > 50:
+                print(f"    [ChatGPT] Copy button visible & text stable ({curr_len} chars)")
+                return current_text
 
-        print(f"    [ChatGPT] Finished capturing response ({len(final_text)} chars)")
-        return final_text
+            # 8. Hard escape: stable for 16 seconds (8 polls) even if stop button is somehow stuck
+            if stable_count >= 8 and current_text and curr_len > 100:
+                print(f"    [ChatGPT] Text stable for 16s. Capturing output ({curr_len} chars)")
+                return current_text
 
-    def _extract_response_text(self, prev_count: int) -> str:
+        # If loop finishes without returning, try one last extract
+        final_text = self._extract_response_text(prev_count) or self._extract_response_fallback()
+        if final_text and len(final_text) >= 50:
+            print(f"    [ChatGPT] Captured response at timeout ({len(final_text)} chars)")
+            return final_text
+
+        print(f"    [ChatGPT] Failed to capture response within timeout.")
+        return None
+
+    def _extract_response_text(self, prev_count: int = 0) -> str:
         """
-        Extract the latest assistant response text from the page.
-
-        Tries multiple strategies:
-        1. Extract from <code> block inside the assistant message
-           (cleaner text, no inner_text artifacts)
-        2. Fall back to inner_text() of the entire message
+        Extract the latest assistant response text.
+        Prioritizes complete JSON objects from <pre> code blocks or message text.
         """
         page = self._page
-        elements = page.query_selector_all(_ASSISTANT_SELECTOR)
+        elements = self._find_assistant_messages()
         if not elements or len(elements) <= prev_count:
             return None
 
         last_msg = elements[-1]
 
-        # Strategy 1: Try to get text from a <code> block
-        # ChatGPT wraps JSON in ```json ... ``` which renders as <pre><code>
+        # Strategy 1: Code blocks inside the assistant message
         try:
-            code_blocks = last_msg.query_selector_all("pre code")
-            if code_blocks:
-                # Use the largest code block (likely the JSON)
-                code_texts = []
-                for cb in code_blocks:
-                    ct = cb.text_content().strip()
-                    if ct:
-                        code_texts.append(ct)
-                if code_texts:
-                    largest = max(code_texts, key=len)
-                    if len(largest) > 100 and '{' in largest:
-                        print(f"    [ChatGPT] Extracted from code block "
-                              f"({len(largest)} chars)")
-                        return largest
+            pre_blocks = last_msg.query_selector_all("pre")
+            for pre in pre_blocks:
+                try:
+                    text = pre.text_content().strip()
+                    json_obj = extract_json_object(text)
+                    if json_obj and len(json_obj) > 100:
+                        return json_obj
+                    if text and '{' in text and len(text) > 100:
+                        return text
+                except Exception:
+                    continue
         except Exception:
             pass
 
-        # Strategy 2: Fall back to inner_text()
+        # Strategy 2: Entire message inner text
         try:
             text = last_msg.inner_text().strip()
             if text:
+                json_obj = extract_json_object(text)
+                if json_obj and len(json_obj) > 100:
+                    return json_obj
+
+                fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+                if fence_match and len(fence_match.group(1).strip()) > 100:
+                    return fence_match.group(1).strip()
+
                 return text
+        except Exception:
+            pass
+
+        return None
+
+    def _extract_response_fallback(self) -> str:
+        """
+        Find JSON anywhere on the page if assistant container matching failed.
+        """
+        page = self._page
+
+        # Strategy 1: All <pre> elements anywhere on page
+        try:
+            pre_blocks = page.query_selector_all("pre")
+            candidates = []
+            for pre in pre_blocks:
+                try:
+                    text = pre.text_content().strip()
+                    json_obj = extract_json_object(text)
+                    if json_obj and len(json_obj) > 100:
+                        candidates.append(json_obj)
+                    elif text and '{' in text and len(text) > 100:
+                        candidates.append(text)
+                except Exception:
+                    continue
+            if candidates:
+                return max(candidates, key=len)
+        except Exception:
+            pass
+
+        # Strategy 2: All markdown / prose blocks
+        try:
+            blocks = page.query_selector_all(".markdown, div.prose")
+            candidates = []
+            for b in blocks:
+                try:
+                    text = b.inner_text().strip()
+                    json_obj = extract_json_object(text)
+                    if json_obj and len(json_obj) > 100:
+                        candidates.append(json_obj)
+                    elif text and '{' in text and len(text) > 100:
+                        candidates.append(text)
+                except Exception:
+                    continue
+            if candidates:
+                return max(candidates, key=len)
+        except Exception:
+            pass
+
+        # Strategy 3: Page body text
+        try:
+            body_text = page.inner_text("body")
+            json_obj = extract_json_object(body_text)
+            if json_obj and len(json_obj) > 150:
+                return json_obj
         except Exception:
             pass
 
@@ -862,30 +1263,66 @@ class ChatGPTSession:
 # Response Parser
 # ═════════════════════════════════════════════════════════════════════════════
 
+def extract_json_object(text: str) -> str:
+    """
+    Extract the first complete, balanced JSON object { ... } from text.
+    Correctly handles nested braces, strings, and escaped characters.
+    Returns None if no complete object is found.
+    """
+    if not text:
+        return None
+
+    start = text.find('{')
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i in range(start, len(text)):
+        char = text[i]
+
+        if escape:
+            escape = False
+            continue
+
+        if char == '\\':
+            escape = True
+            continue
+
+        if char == '"':
+            in_string = not in_string
+            continue
+
+        if not in_string:
+            if char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+
+    return None
+
+
 def _looks_like_json(text: str) -> bool:
-    """Return True if text appears to start with JSON."""
+    """Return True if text appears to contain JSON."""
+    if not text:
+        return False
     stripped = text.lstrip()
-    # Check for { or ```json with {
     if stripped.startswith('{'):
         return True
     if stripped.startswith('```'):
         rest = re.sub(r'^```(?:json)?\s*', '', stripped)
         return rest.lstrip().startswith('{')
-    return False
+    return '{' in text and '}' in text
 
 
 def _json_looks_complete(text: str) -> bool:
     """Return True if the JSON response looks structurally complete."""
-    stripped = text.rstrip()
-    # Strip trailing code fence
-    stripped = re.sub(r'\s*```\s*$', '', stripped).rstrip()
-    # Should end with } for a complete JSON object
-    if not stripped.endswith('}'):
-        return False
-    # Quick bracket balance check
-    opens = stripped.count('{')
-    closes = stripped.count('}')
-    return closes >= opens
+    extracted = extract_json_object(text)
+    return extracted is not None
 
 
 def parse_chatgpt_response(response_text: str) -> dict:
@@ -893,42 +1330,53 @@ def parse_chatgpt_response(response_text: str) -> dict:
     Parse ChatGPT's response text into a JSON dict.
 
     Handles:
+      - Raw JSON text
       - Markdown code fences (```json ... ``` or ``` ... ```)
-      - Extra text before/after the JSON object
+      - Intro/outro text around the JSON object (via balanced bracket extraction)
+      - Common LLM syntax quirks (trailing commas before } or ])
     Returns None if parsing fails.
-
-    NOTE: We rely on _extract_response_text() to get clean text from
-    <pre><code> blocks. If ChatGPT generates invalid JSON, that's a
-    prompt issue — fix the prompt, don't patch the JSON.
     """
     if not response_text:
         return None
 
     text = response_text.strip()
 
-    # Step 1: Strip markdown code fences if present
+    # Attempt 1: Direct parse
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    # Attempt 2: Strip outer markdown code fences
     cleaned = re.sub(r'^```(?:json)?\s*', '', text)
     cleaned = re.sub(r'\s*```$', '', cleaned.strip())
-
-    # Attempt 1: Direct parse (text from <code> blocks is usually clean)
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, dict):
             return parsed
-    except json.JSONDecodeError:
+    except Exception:
         pass
 
-    # Attempt 2: Extract the outermost { … } (skip any surrounding text)
-    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
-    if match:
+    # Attempt 3: Balanced-bracket JSON extraction (handles surrounding prose)
+    extracted = extract_json_object(text)
+    if extracted:
         try:
-            parsed = json.loads(match.group(0))
+            parsed = json.loads(extracted)
             if isinstance(parsed, dict):
                 return parsed
-        except json.JSONDecodeError:
-            pass
+        except Exception:
+            # Try fixing trailing commas: e.g. ", }" -> " }" or ", ]" -> " ]"
+            fixed = re.sub(r',\s*([\]}])', r'\1', extracted)
+            try:
+                parsed = json.loads(fixed)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
 
-    # Attempt 3: Try code-fence block extraction from original text
+    # Attempt 4: Extract from regex markdown code block
     json_block = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
     if json_block:
         block_text = json_block.group(1).strip()
@@ -936,8 +1384,16 @@ def parse_chatgpt_response(response_text: str) -> dict:
             parsed = json.loads(block_text)
             if isinstance(parsed, dict):
                 return parsed
-        except json.JSONDecodeError:
-            pass
+        except Exception:
+            block_extracted = extract_json_object(block_text)
+            if block_extracted:
+                fixed_block = re.sub(r',\s*([\]}])', r'\1', block_extracted)
+                try:
+                    parsed = json.loads(fixed_block)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
 
     # All attempts failed
     print(f"    [!] JSON parse failed. Response preview: "
@@ -1249,6 +1705,7 @@ def enrich_gpt_gen(cve_list: list, nvd_results: dict):
             parsed = parse_chatgpt_response(response)
             if parsed and validate_chatgpt_response(parsed):
                 db.save_cve_analysis(cve_id, parsed)
+                _cleanup_debug_file(cve_id)
                 completed += 1
                 mitre_count = len(parsed.get("mitre_attack_mapping", []))
                 walk_count = len(parsed.get("vulnerability_walkthrough", []))
@@ -1258,6 +1715,7 @@ def enrich_gpt_gen(cve_list: list, nvd_results: dict):
                 print(f"    [~] Response parsed but incomplete. "
                       f"Keys: {list(parsed.keys())}")
                 db.save_cve_analysis(cve_id, parsed)
+                _cleanup_debug_file(cve_id)
                 completed += 1
                 print(f"    [~] Saved partial analysis anyway.")
             else:

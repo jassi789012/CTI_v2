@@ -30,6 +30,7 @@ from Engine_query_input import (
     _list_thread_ids,
     _get_threads_with_state,
 )
+from engine_progress import emit_progress
 
 # ─── Load .env ───────────────────────────────────────────────────────────────
 env_path = BACKEND_DIR.parent / ".env"
@@ -60,17 +61,20 @@ def init_ips_node(state: EngineState) -> dict:
             seen.add(ip)
             unique_ips.append(ip)
 
+    emit_progress("init_ips", "running", f"Loading {len(unique_ips)} IPs")
     print(f"\n{'='*60}")
     print(f"  NODE: Initialize IPs")
     print(f"  IPs provided: {len(unique_ips)}")
     print(f"{'='*60}")
 
     if not unique_ips:
+        emit_progress("init_ips", "done", "No IPs provided")
         return {
             "ips": [],
             "engine_status": "error",
         }
 
+    emit_progress("init_ips", "done", f"{len(unique_ips)} IPs loaded")
     return {
         "ips": unique_ips,
         "engine_status": "running",

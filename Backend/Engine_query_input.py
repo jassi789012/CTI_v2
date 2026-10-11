@@ -19,6 +19,7 @@ from typing import Annotated, TypedDict
 from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.postgres import PostgresSaver
+from langchain_core.runnables import RunnableConfig
 
 # ─── Setup paths ─────────────────────────────────────────────────────────────
 BACKEND_DIR = Path(r"c:\Users\jassi\OneDrive\Documents\CTI_V2\Backend")
@@ -34,6 +35,7 @@ from nmap_scanner import nmap_scan_ips_gen
 from db_manager import DBManager
 from cve_extractor import extract_cves_gen
 from cve_mapper import fetch_nvd_gen, enrich_gpt_gen
+from engine_progress import emit_progress, is_cancelled
 
 # ─── Load .env ───────────────────────────────────────────────────────────────
 env_path = BACKEND_DIR.parent / ".env"
@@ -83,12 +85,17 @@ def query_gen_node(state: EngineState) -> dict:
     user_query = state["query"]
     queries = []
     
+    emit_progress("query_gen", "running", "Starting query generation")
     for progress in generate_queries_gen(user_query):
+        if is_cancelled():
+            raise InterruptedError("Engine cancelled by user")
         status = progress.get("query_genrater", "running")
         queries = progress.get("queries", queries)
+        emit_progress("query_gen", "running", f"{len(queries)} queries generated")
         print(f"\r[Query Gen] Status: {status} | Generated: {len(queries)}", end="")
     print()
 
+    emit_progress("query_gen", "done", f"{len(queries)} queries")
     return {
         "queries": queries,
         "query_genrater": "completed",
@@ -99,13 +106,18 @@ def get_ip_node(state: EngineState) -> dict:
     queries = state.get("queries", [])
     ips = []
     
+    emit_progress("get_ips", "running", "Starting IP discovery")
     for progress in get_ip_query_ip_gen(queries):
+        if is_cancelled():
+            raise InterruptedError("Engine cancelled by user")
         status = progress.get("ip_number_fetcher", "running")
         done = progress.get("ip_number_fetcher_done", "0/0")
         ips = progress.get("ips", ips)
+        emit_progress("get_ips", "running", f"{done} queries | {len(ips)} IPs found")
         print(f"\r[IP Fetch] Status: {status} | Progress: {done} | IPs: {len(ips)}", end="")
     print()
-        
+    
+    emit_progress("get_ips", "done", f"{len(ips)} IPs discovered")
     return {
         "ips": ips,
         "ip_number_fetcher": "completed",
@@ -113,10 +125,12 @@ def get_ip_node(state: EngineState) -> dict:
     }
 
 
-def process_all_ips_node(state: EngineState) -> dict:
+def process_all_ips_node(state: EngineState, config: RunnableConfig) -> dict:
     ips = state.get("ips", [])
+    thread_id = config.get("configurable", {}).get("thread_id")
     
     if not ips:
+        emit_progress("process_all_ips", "done", "No IPs to process")
         return {
             "ip_data_fetcher_shodan": "completed",
             "ip_data_fetcher_shodan_done": "0/0",
@@ -132,7 +146,7 @@ def process_all_ips_node(state: EngineState) -> dict:
         q.put(None)
         
     def run_nmap():
-        for progress in nmap_scan_ips_gen(ips):
+        for progress in nmap_scan_ips_gen(ips, engine_thread_id=thread_id):
             q.put(progress)
         q.put(None)
         
@@ -145,8 +159,17 @@ def process_all_ips_node(state: EngineState) -> dict:
     final_shodan_done = "0/0"
     final_nmap_done = "0/0"
     
+    emit_progress("process_all_ips", "running", f"Shodan: 0/{len(ips)} | Nmap: 0/{len(ips)}")
+    
     while finished_threads < 2:
-        item = q.get()
+        if is_cancelled():
+            raise InterruptedError("Engine cancelled by user")
+            
+        try:
+            item = q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+            
         if item is None:
             finished_threads += 1
             continue
@@ -154,17 +177,20 @@ def process_all_ips_node(state: EngineState) -> dict:
         if "ip_data_fetcher_shodan" in item:
             status = item["ip_data_fetcher_shodan"]
             final_shodan_done = item["ip_data_fetcher_shodan_done"]
+            emit_progress("process_all_ips", "running", f"Shodan: {final_shodan_done} | Nmap: {final_nmap_done}")
             print(f"\r[Shodan] {status} {final_shodan_done} | [Nmap] {final_nmap_done}", end="")
             
         elif "ip_data_fetcher_nmap" in item:
             status = item["ip_data_fetcher_nmap"]
             final_nmap_done = item["ip_data_fetcher_nmap_done"]
+            emit_progress("process_all_ips", "running", f"Shodan: {final_shodan_done} | Nmap: {final_nmap_done}")
             print(f"\r[Shodan] {final_shodan_done} | [Nmap] {status} {final_nmap_done}", end="")
 
     t1.join()
     t2.join()
     print()
     
+    emit_progress("process_all_ips", "done", f"{len(ips)}/{len(ips)} IPs scanned")
     return {
         "ip_data_fetcher_shodan": "completed",
         "ip_data_fetcher_shodan_done": f"{len(ips)}/{len(ips)}",
@@ -177,14 +203,19 @@ def extract_cves_node(state: EngineState) -> dict:
     ips = state.get("ips", [])
     cves = []
     
+    emit_progress("extract_cves", "running", "Starting CVE extraction")
     for progress in extract_cves_gen(ips):
+        if is_cancelled():
+            raise InterruptedError("Engine cancelled by user")
         status = progress.get("cve_extractor", "running")
         done = progress.get("cve_extractor_done", "0/0")
         cves = progress.get("cves", cves)
+        emit_progress("extract_cves", "running", f"{done} | {len(cves)} CVEs found")
         print(f"\r[CVE Extractor] Status: {status} | Progress: {done} | CVEs: {len(cves)}", end="")
     print()
     print()
-        
+    
+    emit_progress("extract_cves", "done", f"{len(cves)} CVEs extracted")
     return {
         "cve": cves,
         "cve_extractor": "completed",
@@ -196,10 +227,14 @@ def cve_mapper_node(state: EngineState) -> dict:
     cves = state.get("cve", [])
     
     nvd_results = {}
+    emit_progress("cve_mapper", "running", "Fetching NVD data")
     for progress in fetch_nvd_gen(cves):
+        if is_cancelled():
+            raise InterruptedError("Engine cancelled by user")
         status = progress.get("nvd_data_fetcher", "running")
         done = progress.get("nvd_data_fetcher_done", "0/0")
         nvd_results = progress.get("nvd_results", nvd_results)
+        emit_progress("cve_mapper", "running", f"NVD: {done}")
         print(f"\r[Mapper NVD] Status: {status} | Progress: {done}", end="")
     print()
         
@@ -211,12 +246,17 @@ def cve_mapper_node(state: EngineState) -> dict:
             cves_needing_analysis.append(cve_id)
     db.close()
     
+    emit_progress("cve_mapper", "running", f"GPT enriching {len(cves_needing_analysis)} CVEs")
     for progress in enrich_gpt_gen(cves_needing_analysis, nvd_results):
+        if is_cancelled():
+            raise InterruptedError("Engine cancelled by user")
         status = progress.get("cve_mapper_gpt", "running")
         done = progress.get("cve_mapper_gpt_done", "0/0")
+        emit_progress("cve_mapper", "running", f"GPT: {done}")
         print(f"\r[Mapper GPT] Status: {status} | Progress: {done}", end="")
     print()
-        
+    
+    emit_progress("cve_mapper", "done", f"{len(cves)} CVEs mapped")
     return {
         "cve_mapper_nvd": "completed",
         "cve_mapper_nvd_done": f"{len(cves)}/{len(cves)}" if cves else "0/0",
@@ -226,6 +266,7 @@ def cve_mapper_node(state: EngineState) -> dict:
 
 
 def summary_node(state: EngineState) -> dict:
+    emit_progress("summary", "running", "Generating summary")
     print(f"\n{'='*60}")
     print(f"  ENGINE COMPLETE")
     print(f"{'='*60}")
@@ -235,6 +276,7 @@ def summary_node(state: EngineState) -> dict:
     print(f"  CVEs extracted:  {len(state.get('cve', []))}")
     print(f"{'='*60}")
 
+    emit_progress("summary", "done", "Engine complete")
     return {
         "engine_status": "complete"
     }

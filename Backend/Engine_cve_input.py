@@ -27,6 +27,7 @@ from Engine_query_input import (
     _list_thread_ids,
     _get_threads_with_state,
 )
+from engine_progress import emit_progress
 
 # ─── Load .env ───────────────────────────────────────────────────────────────
 env_path = BACKEND_DIR.parent / ".env"
@@ -58,17 +59,20 @@ def init_cves_node(state: EngineState) -> dict:
             seen.add(cve_id)
             unique_cves.append(cve_id)
 
+    emit_progress("init_cves", "running", f"Loading {len(unique_cves)} CVEs")
     print(f"\n{'='*60}")
     print(f"  NODE: Initialize CVEs")
     print(f"  CVEs provided: {len(unique_cves)}")
     print(f"{'='*60}")
 
     if not unique_cves:
+        emit_progress("init_cves", "done", "No CVEs provided")
         return {
             "cve": [],
             "engine_status": "error",
         }
 
+    emit_progress("init_cves", "done", f"{len(unique_cves)} CVEs loaded")
     return {
         "cve": unique_cves,
         "engine_status": "running",
