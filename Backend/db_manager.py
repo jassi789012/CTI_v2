@@ -652,40 +652,53 @@ class DBManager:
     # ═════════════════════════════════════════════════════════════════════════
 
     def get_host_by_ip(self, ip: str) -> dict:
-        """Get host info by IP address. Returns None if not found."""
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM hosts WHERE ip = %s::inet", (ip,))
-            row = cur.fetchone()
-            return dict(row) if row else None
+        """Get host info by IP address. Returns None if not found or invalid."""
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM hosts WHERE ip = %s::inet", (ip.strip(),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+        except Exception:
+            self.conn.rollback()
+            return None
 
     def get_scan_count(self, ip: str, source: str = None) -> int:
         """Get the number of scans for an IP, optionally filtered by source."""
-        with self.conn.cursor() as cur:
-            if source:
-                cur.execute("""
-                    SELECT COUNT(*) FROM scans s
-                    JOIN hosts h ON h.id = s.host_id
-                    WHERE h.ip = %s::inet AND s.source = %s
-                """, (ip, source))
-            else:
-                cur.execute("""
-                    SELECT COUNT(*) FROM scans s
-                    JOIN hosts h ON h.id = s.host_id
-                    WHERE h.ip = %s::inet
-                """, (ip,))
-            return cur.fetchone()[0]
+        try:
+            with self.conn.cursor() as cur:
+                if source:
+                    cur.execute("""
+                        SELECT COUNT(*) FROM scans s
+                        JOIN hosts h ON h.id = s.host_id
+                        WHERE h.ip = %s::inet AND s.source = %s
+                    """, (ip.strip(), source))
+                else:
+                    cur.execute("""
+                        SELECT COUNT(*) FROM scans s
+                        JOIN hosts h ON h.id = s.host_id
+                        WHERE h.ip = %s::inet
+                    """, (ip.strip(),))
+                row = cur.fetchone()
+                return row[0] if row else 0
+        except Exception:
+            self.conn.rollback()
+            return 0
 
     def get_host_timeline(self, ip: str) -> list:
         """Get all scan snapshots for an IP, ordered by date (newest first)."""
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT s.id, s.source, s.source_last_seen, s.scraped_at, s.metadata
-                FROM scans s
-                JOIN hosts h ON h.id = s.host_id
-                WHERE h.ip = %s::inet
-                ORDER BY s.scraped_at DESC
-            """, (ip,))
-            return [dict(row) for row in cur.fetchall()]
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT s.id, s.source, s.source_last_seen, s.scraped_at, s.metadata
+                    FROM scans s
+                    JOIN hosts h ON h.id = s.host_id
+                    WHERE h.ip = %s::inet
+                    ORDER BY s.scraped_at DESC
+                """, (ip.strip(),))
+                return [dict(row) for row in cur.fetchall()]
+        except Exception:
+            self.conn.rollback()
+            return []
 
     # ═════════════════════════════════════════════════════════════════════════
     # CVE Operations (for cve_mapper)

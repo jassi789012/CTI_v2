@@ -79,10 +79,32 @@ def cancel_engine(chat_thread_id: str = None, engine_thread_id: str = None):
         evt = _cancel_events.get(chat_thread_id)
         if evt:
             evt.set()
+        else:
+            evt = threading.Event()
+            evt.set()
+            _cancel_events[chat_thread_id] = evt
+
     if engine_thread_id:
         evt = _cancel_events_by_engine.get(engine_thread_id)
         if evt:
             evt.set()
+        else:
+            evt = threading.Event()
+            evt.set()
+            _cancel_events_by_engine[engine_thread_id] = evt
+
+    # Directly terminate running subprocesses / browser scrapers
+    try:
+        from def_nmap.nmap_scanner import cancel_nmap_scanners
+        cancel_nmap_scanners(engine_thread_id)
+    except Exception:
+        pass
+
+    try:
+        from def_Shodan.get_ip_info import cancel_shodan_scraper
+        cancel_shodan_scraper(engine_thread_id)
+    except Exception:
+        pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -213,11 +235,11 @@ def is_cancelled(engine_thread_id: str = None, chat_thread_id: str = None) -> bo
         target_eid = engine_thread_id or local_engine
         if target_eid:
             rec = mgr.get_record(target_eid)
-            if rec and (rec.cancel_event.is_set() or rec.status == "paused"):
+            if rec and (rec.cancel_event.is_set() or rec.status in ("paused", "stopped")):
                 return True
         if local_chat:
             rec = mgr.get_running_engine(local_chat)
-            if rec and (rec.cancel_event.is_set() or rec.status == "paused"):
+            if rec and (rec.cancel_event.is_set() or rec.status in ("paused", "stopped")):
                 return True
     except Exception:
         pass

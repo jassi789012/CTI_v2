@@ -18,6 +18,66 @@ HOST_DELAY_SECONDS = 2.0   # Courtesy delay between host page requests
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_OUTPUT_FILE = "shodan_results.json"
 
+import threading
+
+# Active Shodan Playwright resource registry for fast cancellation
+_active_shodan_resources: dict[str, dict] = {}
+_shodan_lock = threading.Lock()
+
+def _register_shodan(engine_thread_id: str, pw, browser, context, page):
+    if not engine_thread_id:
+        return
+    with _shodan_lock:
+        _active_shodan_resources[engine_thread_id] = {
+            "pw": pw,
+            "browser": browser,
+            "context": context,
+            "page": page,
+        }
+
+def _unregister_shodan(engine_thread_id: str):
+    if not engine_thread_id:
+        return
+    with _shodan_lock:
+        _active_shodan_resources.pop(engine_thread_id, None)
+
+def cancel_shodan_scraper(engine_thread_id: str = None):
+    """Immediately close Playwright page/browser for the given engine (or all)."""
+    with _shodan_lock:
+        if engine_thread_id:
+            items = [_active_shodan_resources.get(engine_thread_id)]
+        else:
+            items = list(_active_shodan_resources.values())
+
+    for res in items:
+        if not res:
+            continue
+        try:
+            p = res.get("page")
+            if p:
+                p.close()
+        except Exception:
+            pass
+        try:
+            c = res.get("context")
+            if c:
+                c.close()
+        except Exception:
+            pass
+        try:
+            b = res.get("browser")
+            if b:
+                b.close()
+        except Exception:
+            pass
+        try:
+            pw = res.get("pw")
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
+
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Legacy JSON File I/O (kept for backward compatibility / offline fallback)
@@ -437,7 +497,7 @@ def extract_port_cves(page, open_ports: list) -> dict:
 # Main scraper orchestrator
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scrape_host_info(page, ip: str) -> dict:
+def scrape_host_info(page, ip: str, engine_thread_id: str = None) -> dict:
     """
     Navigate to a host's Shodan page, parse static HTML, then use Playwright
     to extract port-specific CVEs via the vulnerability filter dropdown.
@@ -482,6 +542,13 @@ def scrape_host_info(page, ip: str) -> dict:
         return parsed_data
 
     except Exception as e:
+        if engine_thread_id:
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled(engine_thread_id=engine_thread_id):
+                    raise InterruptedError("Engine cancelled by user")
+            except ImportError:
+                pass
         print(f"[-] Error scraping host {ip}: {e}")
         return {
             "ip": ip,
@@ -489,7 +556,7 @@ def scrape_host_info(page, ip: str) -> dict:
         }
 
 
-def get_ip_info_gen(ip_list):
+def get_ip_info_gen(ip_list, engine_thread_id: str = None):
     """
     Generator that scrapes Shodan host details for a list of IPs.
 
@@ -503,6 +570,7 @@ def get_ip_info_gen(ip_list):
 
     Args:
         ip_list: List of IP address strings.
+        engine_thread_id: Optional engine thread ID for cancellation tracking.
     """
     if not ip_list:
         yield {
@@ -555,14 +623,29 @@ def get_ip_info_gen(ip_list):
         return
 
     pw, browser, context, page = result
+    _register_shodan(engine_thread_id, pw, browser, context, page)
+
+    stop_monitor = threading.Event()
+    def _cancel_monitor():
+        while not stop_monitor.is_set():
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled(engine_thread_id=engine_thread_id):
+                    cancel_shodan_scraper(engine_thread_id)
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+    threading.Thread(target=_cancel_monitor, daemon=True).start()
 
     try:
         for idx, target_ip in enumerate(clean_ips, start=1):
             try:
                 from engine_progress import is_cancelled
-                if is_cancelled():
+                if is_cancelled(engine_thread_id=engine_thread_id):
                     print(f"[*] Shodan scraper paused/cancelled by user.")
-                    break
+                    raise InterruptedError("Engine cancelled by user")
             except ImportError:
                 pass
 
@@ -596,7 +679,14 @@ def get_ip_info_gen(ip_list):
                             "ip_data_fetcher_shodan_done": f"{idx}/{total}",
                         }
                         if idx < total:
-                            time.sleep(HOST_DELAY_SECONDS)
+                            for _ in range(int(HOST_DELAY_SECONDS * 10)):
+                                try:
+                                    from engine_progress import is_cancelled
+                                    if is_cancelled(engine_thread_id=engine_thread_id):
+                                        raise InterruptedError("Engine cancelled by user")
+                                except ImportError:
+                                    pass
+                                time.sleep(0.1)
                         continue
                     else:
                         print(f"[!] Data has changed (db={stored_last_seen}, shodan={live_last_seen}). Re-scraping...")
@@ -615,15 +705,24 @@ def get_ip_info_gen(ip_list):
 
                         db.save_shodan_scan(parsed_data)
 
+                except InterruptedError:
+                    raise
                 except Exception as e:
+                    if engine_thread_id:
+                        try:
+                            from engine_progress import is_cancelled
+                            if is_cancelled(engine_thread_id=engine_thread_id):
+                                raise InterruptedError("Engine cancelled by user")
+                        except ImportError:
+                            pass
                     print(f"[-] Error during update check for {target_ip}: {e}")
                     print("    Will attempt full scrape...")
-                    host_info = scrape_host_info(page, target_ip)
+                    host_info = scrape_host_info(page, target_ip, engine_thread_id=engine_thread_id)
                     if "error" not in host_info:
                         db.save_shodan_scan(host_info)
             else:
                 # ── New IP — full scrape ─────────────────────────────────
-                host_info = scrape_host_info(page, target_ip)
+                host_info = scrape_host_info(page, target_ip, engine_thread_id=engine_thread_id)
                 if "error" not in host_info:
                     db.save_shodan_scan(host_info)
                 else:
@@ -636,17 +735,38 @@ def get_ip_info_gen(ip_list):
 
             # Polite delay between IPs
             if idx < total:
-                time.sleep(HOST_DELAY_SECONDS)
+                for _ in range(int(HOST_DELAY_SECONDS * 10)):
+                    try:
+                        from engine_progress import is_cancelled
+                        if is_cancelled(engine_thread_id=engine_thread_id):
+                            raise InterruptedError("Engine cancelled by user")
+                    except ImportError:
+                        pass
+                    time.sleep(0.1)
 
         print(f"\n{'='*60}")
         print(f"[DONE] Scraping complete. Total IPs processed: {total}")
         print(f"{'='*60}")
 
     finally:
-        save_cookies(context)
-        browser.close()
-        pw.stop()
-        db.close()
+        stop_monitor.set()
+        _unregister_shodan(engine_thread_id)
+        try:
+            save_cookies(context)
+        except Exception:
+            pass
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        try:
+            db.close()
+        except Exception:
+            pass
 
     yield {
         "ip_data_fetcher_shodan": "completed",
@@ -658,7 +778,7 @@ def get_ip_info_gen(ip_list):
 # Synchronous Wrapper
 # ═════════════════════════════════════════════════════════════════════════════
 
-def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
+def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE, engine_thread_id: str = None):
     """
     Main entry point to fetch and parse Shodan host details for one or more IPs.
 
@@ -677,6 +797,7 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
       ip: A single IP string or a list/iterable of IP strings.
       output_file: (Legacy) Path to JSON results file. No longer used for primary
                    storage but kept for API compatibility.
+      engine_thread_id: Optional engine thread ID.
 
     Returns:
       None — data is saved directly to the database.
@@ -692,7 +813,7 @@ def get_ip_info_json(ip, output_file: str = DEFAULT_OUTPUT_FILE):
         print("[-] No valid IP addresses provided.")
         return
 
-    for progress in get_ip_info_gen(ip_list):
+    for progress in get_ip_info_gen(ip_list, engine_thread_id=engine_thread_id):
         pass
 
 

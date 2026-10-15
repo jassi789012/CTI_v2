@@ -58,47 +58,127 @@ from db_manager import DBManager
 TCP_PORT_ARGS = "-p-"
 
 # Maximum parallel IP scans
-MAX_WORKERS = 4
+MAX_WORKERS = 5
+
+# Active scanner processes registry for fast cancellation
+_active_nmap_scanners: dict[str, set] = {}
+_active_nmap_lock = threading.Lock()
+
+def _register_nmap_scanner(engine_thread_id: str, scanner):
+    if not engine_thread_id or not scanner:
+        return
+    with _active_nmap_lock:
+        if engine_thread_id not in _active_nmap_scanners:
+            _active_nmap_scanners[engine_thread_id] = set()
+        _active_nmap_scanners[engine_thread_id].add(scanner)
+
+def _unregister_nmap_scanner(engine_thread_id: str, scanner):
+    if not engine_thread_id or not scanner:
+        return
+    with _active_nmap_lock:
+        if engine_thread_id in _active_nmap_scanners:
+            _active_nmap_scanners[engine_thread_id].discard(scanner)
+            if not _active_nmap_scanners[engine_thread_id]:
+                _active_nmap_scanners.pop(engine_thread_id, None)
+
+def cancel_nmap_scanners(engine_thread_id: str = None):
+    """Terminate all active nmap processes for the engine (or all if None)."""
+    with _active_nmap_lock:
+        if engine_thread_id:
+            scanners = list(_active_nmap_scanners.get(engine_thread_id, []))
+        else:
+            scanners = [s for group in _active_nmap_scanners.values() for s in group]
+
+    for sc in scanners:
+        # python-nmap stores subprocess.Popen as _PortScanner__process
+        proc = getattr(sc, '_PortScanner__process', None)
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+def _run_safe_scan(scanner, hosts, arguments, engine_thread_id=None):
+    """Run scanner.scan with registration and immediate cancellation support."""
+    if engine_thread_id:
+        try:
+            from engine_progress import is_cancelled
+            if is_cancelled(engine_thread_id=engine_thread_id):
+                raise InterruptedError("Engine cancelled by user")
+        except ImportError:
+            pass
+        _register_nmap_scanner(engine_thread_id, scanner)
+
+    try:
+        scanner.scan(hosts=hosts, arguments=arguments)
+    except InterruptedError:
+        raise
+    except Exception as e:
+        if engine_thread_id:
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled(engine_thread_id=engine_thread_id):
+                    raise InterruptedError("Engine cancelled by user")
+            except ImportError:
+                pass
+        raise
+    finally:
+        if engine_thread_id:
+            _unregister_nmap_scanner(engine_thread_id, scanner)
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled(engine_thread_id=engine_thread_id):
+                    raise InterruptedError("Engine cancelled by user")
+            except ImportError:
+                pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 1–8: Individual Scan Functions
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _phase1_tcp_discovery(scanner, ip):
+def _phase1_tcp_discovery(scanner, ip, engine_thread_id=None):
     """
     Phase 1: TCP port discovery + service/version (max intensity) + OS +
     traceroute. This is the core scan that discovers what's running.
     """
     print(f"    [1/8] TCP port discovery + service detection + OS fingerprint...")
     try:
-        scanner.scan(
+        _run_safe_scan(
+            scanner,
             hosts=ip,
             arguments=(
                 f"-sS -sV --version-intensity 9 -sC -O -T4 "
                 f"{TCP_PORT_ARGS} --traceroute --open --reason"
             ),
+            engine_thread_id=engine_thread_id,
         )
+    except InterruptedError:
+        raise
     except Exception as e:
         print(f"    [!] Phase 1 error: {e}")
 
 
-def _phase2_udp(scanner, ip):
+def _phase2_udp(scanner, ip, engine_thread_id=None):
     """
     Phase 2: UDP scan on top 500 ports.
     Catches DNS, SNMP, NTP, TFTP, LDAP, DHCP, SIP, mDNS, etc.
     """
     print(f"    [2/8] UDP top 500 ports...")
     try:
-        scanner.scan(
+        _run_safe_scan(
+            scanner,
             hosts=ip,
             arguments="-sU -sV -T4 --top-ports 500 --version-intensity 0 --open",
+            engine_thread_id=engine_thread_id,
         )
+    except InterruptedError:
+        raise
     except Exception as e:
         print(f"    [!] Phase 2 (UDP) error: {e}")
 
 
-def _phase3_vuln_scripts(scanner, ip, open_ports):
+def _phase3_vuln_scripts(scanner, ip, open_ports, engine_thread_id=None):
     """
     Phase 3: Vulnerability scripts on discovered open ports.
     Includes both 'vuln' category and 'vulners' (CVE cross-reference via CPE).
@@ -109,15 +189,19 @@ def _phase3_vuln_scripts(scanner, ip, open_ports):
     port_str = ",".join(str(p) for p in open_ports)
     print(f"    [3/8] Vulnerability scripts on {len(open_ports)} open ports...")
     try:
-        scanner.scan(
+        _run_safe_scan(
+            scanner,
             hosts=ip,
             arguments=f"-sV -T4 -p {port_str} --script vuln,vulners",
+            engine_thread_id=engine_thread_id,
         )
+    except InterruptedError:
+        raise
     except Exception as e:
         print(f"    [!] Phase 3 (vuln) error: {e}")
 
 
-def _phase4_comprehensive_enum(scanner, ip, open_ports):
+def _phase4_comprehensive_enum(scanner, ip, open_ports, engine_thread_id=None):
     """
     Phase 4: Comprehensive NSE enumeration — 60+ scripts across 14 categories.
     """
@@ -201,29 +285,37 @@ def _phase4_comprehensive_enum(scanner, ip, open_ports):
     script_str = ",".join(scripts)
     print(f"    [4/8] Comprehensive enumeration ({len(scripts)} scripts)...")
     try:
-        scanner.scan(
+        _run_safe_scan(
+            scanner,
             hosts=ip,
             arguments=f"-sV -T4 -p {port_str} --script {script_str}",
+            engine_thread_id=engine_thread_id,
         )
+    except InterruptedError:
+        raise
     except Exception as e:
         print(f"    [!] Phase 4 (enum) error: {e}")
 
 
-def _phase5_geoip_dns(scanner, ip):
+def _phase5_geoip_dns(scanner, ip, engine_thread_id=None):
     """
     Phase 5: GeoIP lookup + DNS reverse resolution + whois.
     """
     print(f"    [5/8] GeoIP & DNS reverse lookup...")
     try:
-        scanner.scan(
+        _run_safe_scan(
+            scanner,
             hosts=ip,
             arguments="-sn --script ip-geolocation-geoplugin,whois-ip,dns-brute,fcrdns",
+            engine_thread_id=engine_thread_id,
         )
+    except InterruptedError:
+        raise
     except Exception as e:
         print(f"    [!] Phase 5 (GeoIP) error: {e}")
 
 
-def _phase6_firewall_detection(scanner, ip, open_ports):
+def _phase6_firewall_detection(scanner, ip, open_ports, engine_thread_id=None):
     """
     Phase 6: Firewall/filtering detection via ACK scan + Window scan.
     """
@@ -235,40 +327,52 @@ def _phase6_firewall_detection(scanner, ip, open_ports):
     print(f"    [6/8] Firewall detection on {len(test_ports)} ports...")
     try:
         # ACK scan for filtered port analysis
-        scanner.scan(
+        _run_safe_scan(
+            scanner,
             hosts=ip,
             arguments=f"-sA -T4 -p {port_str}",
+            engine_thread_id=engine_thread_id,
         )
+    except InterruptedError:
+        raise
     except Exception as e:
         print(f"    [!] Phase 6 (firewall) error: {e}")
 
 
-def _phase7_ip_protocol_scan(scanner, ip):
+def _phase7_ip_protocol_scan(scanner, ip, engine_thread_id=None):
     """
     Phase 7: IP Protocol scan — discovers which IP protocols
     (TCP, UDP, ICMP, IGMP, GRE, ESP, etc.) the host responds to.
     """
     print(f"    [7/8] IP Protocol scan...")
     try:
-        scanner.scan(
+        _run_safe_scan(
+            scanner,
             hosts=ip,
             arguments="-sO -T4",
+            engine_thread_id=engine_thread_id,
         )
+    except InterruptedError:
+        raise
     except Exception as e:
         print(f"    [!] Phase 7 (protocol) error: {e}")
 
 
-def _phase8_sctp_scan(scanner, ip):
+def _phase8_sctp_scan(scanner, ip, engine_thread_id=None):
     """
     Phase 8: SCTP Init scan — discovers SCTP services (telecom, VoIP,
     diameter, SS7 signaling, etc.)
     """
     print(f"    [8/8] SCTP Init scan (top 100)...")
     try:
-        scanner.scan(
+        _run_safe_scan(
+            scanner,
             hosts=ip,
             arguments="-sY -T4 --top-ports 100 --open",
+            engine_thread_id=engine_thread_id,
         )
+    except InterruptedError:
+        raise
     except Exception as e:
         print(f"    [!] Phase 8 (SCTP) error: {e}")
 
@@ -746,7 +850,7 @@ def _extract_structured_data(result):
 # Full-Spectrum Multi-Phase Scan (single IP)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
+def _scan_ip_multiphase(ip: str, engine_thread_id: str = None, worker_id: int = None) -> dict:
     """
     Run a full-spectrum 9-phase Nmap scan on a single IP.
 
@@ -826,14 +930,14 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
 
     try:
         from engine_progress import emit_progress
-        node_name = f"nmap_{ip.replace('.', '_')}"
+        node_name = f"nmap_worker_{worker_id}" if worker_id is not None else f"nmap_{ip.replace('.', '_')}"
     except ImportError:
         emit_progress = None
 
     def _update_ui(phase: int, desc: str):
         if emit_progress:
             try:
-                emit_progress(node_name, "running", f"Phase {phase}/9: {desc}")
+                emit_progress(node_name, "running", f"{ip} — Phase {phase}/9: {desc}")
             except Exception:
                 pass
 
@@ -845,17 +949,26 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
             scanner = nmap.PortScanner()
             print(f"    [1/9] TCP port discovery (all 65535 ports)...")
             try:
-                scanner.scan(
+                _run_safe_scan(
+                    scanner,
                     hosts=ip,
                     arguments=f"-sS -T4 {TCP_PORT_ARGS} --open --reason",
+                    engine_thread_id=engine_thread_id,
                 )
+            except InterruptedError:
+                raise
             except Exception as e:
+                _check_cancel()
                 print(f"    [!] Phase 1 error: {e}")
 
             if ip not in scanner.all_hosts() or scanner[ip].state() is None:
                 elapsed = round(time.time() - start_time, 1)
                 print(f"  [-] {ip}: Host seems down ({elapsed}s)")
-                if emit_progress: emit_progress(node_name, "error", "Host down")
+                if emit_progress:
+                    if worker_id is not None:
+                        emit_progress(node_name, "running", f"{ip} — Host down")
+                    else:
+                        emit_progress(node_name, "error", "Host down")
                 return {"ip": ip, "error": "Host down or not responding"}
 
             state["host_status"] = scanner[ip].state()
@@ -888,14 +1001,19 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
                 scanner = nmap.PortScanner()
                 print(f"    [2/9] Service detection + OS on {len(open_tcp)} ports...")
                 try:
-                    scanner.scan(
+                    _run_safe_scan(
+                        scanner,
                         hosts=ip,
                         arguments=(
                             f"-sV --version-intensity 5 -sC -O -T4 "
                             f"-p {port_str} --traceroute --reason"
                         ),
+                        engine_thread_id=engine_thread_id,
                     )
+                except InterruptedError:
+                    raise
                 except Exception as e:
+                    _check_cancel()
                     print(f"    [!] Phase 2 error: {e}")
 
                 p2 = _parse_phase_host(scanner, ip)
@@ -942,11 +1060,16 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
             scanner = nmap.PortScanner()
             print(f"    [3/9] UDP top 500 ports...")
             try:
-                scanner.scan(
+                _run_safe_scan(
+                    scanner,
                     hosts=ip,
                     arguments="-sU -sV -T4 --top-ports 500 --version-intensity 0 --open",
+                    engine_thread_id=engine_thread_id,
                 )
+            except InterruptedError:
+                raise
             except Exception as e:
+                _check_cancel()
                 print(f"    [!] Phase 3 (UDP) error: {e}")
 
             p3 = _parse_phase_host(scanner, ip)
@@ -980,11 +1103,16 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
                 scanner = nmap.PortScanner()
                 print(f"    [4/9] Vulnerability scripts on {len(all_open)} ports...")
                 try:
-                    scanner.scan(
+                    _run_safe_scan(
+                        scanner,
                         hosts=ip,
                         arguments=f"-sV -T4 -p {port_str} --script vuln,vulners",
+                        engine_thread_id=engine_thread_id,
                     )
+                except InterruptedError:
+                    raise
                 except Exception as e:
+                    _check_cancel()
                     print(f"    [!] Phase 4 (vuln) error: {e}")
 
                 p4 = _parse_phase_host(scanner, ip)
@@ -1071,11 +1199,16 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
                 scanner = nmap.PortScanner()
                 print(f"    [5/9] Comprehensive enumeration ({len(scripts)} scripts)...")
                 try:
-                    scanner.scan(
+                    _run_safe_scan(
+                        scanner,
                         hosts=ip,
                         arguments=f"-sV -T4 -p {port_str} --script {script_str}",
+                        engine_thread_id=engine_thread_id,
                     )
+                except InterruptedError:
+                    raise
                 except Exception as e:
+                    _check_cancel()
                     print(f"    [!] Phase 5 (enum) error: {e}")
 
                 p5 = _parse_phase_host(scanner, ip)
@@ -1099,11 +1232,16 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
             scanner = nmap.PortScanner()
             print(f"    [6/9] GeoIP & DNS reverse lookup...")
             try:
-                scanner.scan(
+                _run_safe_scan(
+                    scanner,
                     hosts=ip,
                     arguments="-sn --script ip-geolocation-geoplugin,whois-ip,dns-brute,fcrdns",
+                    engine_thread_id=engine_thread_id,
                 )
+            except InterruptedError:
+                raise
             except Exception as e:
+                _check_cancel()
                 print(f"    [!] Phase 6 (GeoIP) error: {e}")
 
             geo_data = _parse_geoip(scanner, ip)
@@ -1129,11 +1267,16 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
                 scanner = nmap.PortScanner()
                 print(f"    [7/9] Firewall detection on {len(test_ports)} ports...")
                 try:
-                    scanner.scan(
+                    _run_safe_scan(
+                        scanner,
                         hosts=ip,
                         arguments=f"-sA -T4 -p {port_str}",
+                        engine_thread_id=engine_thread_id,
                     )
+                except InterruptedError:
+                    raise
                 except Exception as e:
+                    _check_cancel()
                     print(f"    [!] Phase 7 (firewall) error: {e}")
 
                 p7 = _parse_phase_host(scanner, ip)
@@ -1165,8 +1308,16 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
             scanner = nmap.PortScanner()
             print(f"    [8/9] IP Protocol scan...")
             try:
-                scanner.scan(hosts=ip, arguments="-sO -T4")
+                _run_safe_scan(
+                    scanner,
+                    hosts=ip,
+                    arguments="-sO -T4",
+                    engine_thread_id=engine_thread_id,
+                )
+            except InterruptedError:
+                raise
             except Exception as e:
+                _check_cancel()
                 print(f"    [!] Phase 8 (protocol) error: {e}")
 
             state["ip_protocols"] = _parse_ip_protocol_scan(scanner, ip)
@@ -1182,8 +1333,16 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
             scanner = nmap.PortScanner()
             print(f"    [9/9] SCTP Init scan (top 100)...")
             try:
-                scanner.scan(hosts=ip, arguments="-sY -T4 --top-ports 100 --open")
+                _run_safe_scan(
+                    scanner,
+                    hosts=ip,
+                    arguments="-sY -T4 --top-ports 100 --open",
+                    engine_thread_id=engine_thread_id,
+                )
+            except InterruptedError:
+                raise
             except Exception as e:
+                _check_cancel()
                 print(f"    [!] Phase 9 (SCTP) error: {e}")
 
             p9 = _parse_phase_host(scanner, ip)
@@ -1353,7 +1512,10 @@ def _scan_ip_multiphase(ip: str, engine_thread_id: str = None) -> dict:
             result["smb_info"] = result_for_parsing["smb_info"]
             
         if emit_progress:
-            emit_progress(node_name, "done", f"Scan complete ({elapsed}s)")
+            if worker_id is not None:
+                emit_progress(node_name, "running", f"{ip} — Scan complete ({elapsed}s)")
+            else:
+                emit_progress(node_name, "done", f"Scan complete ({elapsed}s)")
 
         return result
 
@@ -1595,6 +1757,21 @@ def nmap_scan_ips_gen(
     except ImportError:
         pass
 
+    # ─── Worker ID Queue for fixed worker slots ─────────────────────────
+    import queue as q_module
+    worker_id_queue = q_module.Queue()
+    for w in range(1, num_workers + 1):
+        worker_id_queue.put(w)
+
+    # Initialize fixed worker slot UI nodes immediately
+    if parent_context and parent_context[0]:
+        try:
+            from engine_progress import emit_progress
+            for w in range(1, num_workers + 1):
+                emit_progress(f"nmap_worker_{w}", "running", f"Worker {w} waiting for target...")
+        except Exception:
+            pass
+
     # ─── Worker function ─────────────────────────────────────────────────
     def _scan_worker(ip_index_tuple):
         if parent_context and parent_context[0]:
@@ -1603,30 +1780,45 @@ def nmap_scan_ips_gen(
             except Exception:
                 pass
 
+        worker_id = None
+        try:
+            worker_id = worker_id_queue.get(timeout=5.0)
+        except Exception:
+            worker_id = 1
+
         try:
             i, ip = ip_index_tuple
             try:
                 from engine_progress import is_cancelled
                 if is_cancelled(engine_thread_id=engine_thread_id):
-                    return {"ip": ip, "error": "Scan cancelled by user"}
+                    raise InterruptedError("Scan cancelled by user")
             except ImportError:
                 pass
 
-            print(f"\n[{i}/{total}] Scanning: {ip}")
+            print(f"\n[{i}/{total}] [Worker {worker_id}] Scanning: {ip}")
 
             if multiphase:
-                parsed = _scan_ip_multiphase(ip, engine_thread_id=engine_thread_id)
+                parsed = _scan_ip_multiphase(ip, engine_thread_id=engine_thread_id, worker_id=worker_id)
             else:
+                try:
+                    from engine_progress import emit_progress
+                    emit_progress(f"nmap_worker_{worker_id}", "running", f"{ip} — Scanning ports...")
+                except Exception:
+                    pass
                 nm = nmap.PortScanner()
                 try:
-                    nm.scan(
+                    _run_safe_scan(
+                        nm,
                         hosts=ip,
                         arguments=(
                             f"-sS -sV -O --script default,vuln,ssl-enum-ciphers,"
                             f"http-title,http-headers,banner -T4 "
                             f"{TCP_PORT_ARGS} --open --reason"
                         ),
+                        engine_thread_id=engine_thread_id,
                     )
+                except InterruptedError:
+                    raise
                 except Exception as e:
                     print(f"[-] Nmap error for {ip}: {e}")
                     return {"ip": ip, "error": str(e)}
@@ -1654,8 +1846,14 @@ def nmap_scan_ips_gen(
                         print(f"    [-] DB save error: {e}")
 
             return parsed
-            
+        except InterruptedError:
+            raise
         finally:
+            if worker_id is not None:
+                try:
+                    worker_id_queue.put(worker_id)
+                except Exception:
+                    pass
             if parent_context and parent_context[0]:
                 try:
                     clear_context()
@@ -1667,23 +1865,54 @@ def nmap_scan_ips_gen(
     completed_count = 0
     all_results = []
 
+    pool = ThreadPoolExecutor(max_workers=num_workers)
+    stop_monitor = threading.Event()
+
+    def _cancel_monitor():
+        while not stop_monitor.is_set():
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled(engine_thread_id=engine_thread_id):
+                    cancel_nmap_scanners(engine_thread_id)
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+    threading.Thread(target=_cancel_monitor, daemon=True).start()
+
     try:
-        with ThreadPoolExecutor(max_workers=num_workers) as pool:
-            futures = {pool.submit(_scan_worker, item): item for item in indexed_ips}
-            for future in as_completed(futures):
-                try:
-                    from engine_progress import is_cancelled
-                    if is_cancelled(engine_thread_id=engine_thread_id):
-                        raise InterruptedError("Engine cancelled by user")
-                except ImportError:
-                    pass
+        futures = {pool.submit(_scan_worker, item): item for item in indexed_ips}
+        for future in as_completed(futures):
+            try:
+                from engine_progress import is_cancelled
+                if is_cancelled(engine_thread_id=engine_thread_id):
+                    cancel_nmap_scanners(engine_thread_id)
+                    raise InterruptedError("Engine cancelled by user")
+            except ImportError:
+                pass
+
+            try:
                 result = future.result()
-                all_results.append(result)
-                completed_count += 1
-                yield {
-                    "ip_data_fetcher_nmap": "running",
-                    "ip_data_fetcher_nmap_done": f"{completed_count}/{total}",
-                }
+            except InterruptedError:
+                cancel_nmap_scanners(engine_thread_id)
+                raise
+
+            all_results.append(result)
+            completed_count += 1
+            yield {
+                "ip_data_fetcher_nmap": "running",
+                "ip_data_fetcher_nmap_done": f"{completed_count}/{total}",
+            }
+
+        # Mark all worker slots as done
+        if parent_context and parent_context[0]:
+            try:
+                from engine_progress import emit_progress
+                for w in range(1, num_workers + 1):
+                    emit_progress(f"nmap_worker_{w}", "done", "Completed")
+            except Exception:
+                pass
 
         # ─── Summary ─────────────────────────────────────────────────────────
         print(f"\n{'='*70}")
@@ -1699,6 +1928,12 @@ def nmap_scan_ips_gen(
         print(f"{'='*70}\n")
 
     finally:
+        stop_monitor.set()
+        cancel_nmap_scanners(engine_thread_id)
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         if db:
             try:
                 db.close()

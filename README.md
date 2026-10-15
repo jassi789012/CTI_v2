@@ -23,7 +23,16 @@
   - [Shodan Web Scraping Automation](#shodan-web-scraping-automation)
   - [Dual-Source CVE Mapping (NVD + ChatGPT)](#dual-source-cve-mapping-nvd--chatgpt)
 - [Web Applications & UI](#web-applications--ui)
+  - [1. AI Threat Analyst Chat (`/` & `/chat`)](#1-ai-threat-analyst-chat---chat)
+  - [2. Threat Search Engine (`/search`)](#2-threat-search-engine-search)
+  - [3. Host Intelligence Page (`/ip/:ip`)](#3-host-intelligence-page-ipip)
+  - [4. Vulnerability Intelligence Page (`/cve/:cveId`)](#4-vulnerability-intelligence-page-cvecveid)
+  - [5. Cyberpunk 404 Error Page (`*`)](#5-cyberpunk-404-error-page-)
 - [API Reference](#api-reference)
+  - [Chat & AI Agent Endpoints (7)](#chat--ai-agent-endpoints-7)
+  - [Engine Lifecycle & Streaming Endpoints (4)](#engine-lifecycle--streaming-endpoints-4)
+  - [Threat Search & OSINT Intelligence Endpoints (4)](#threat-search--osint-intelligence-endpoints-4)
+  - [System & Health Endpoints (2)](#system--health-endpoints-2)
 - [Database Architecture](#database-architecture)
 - [Prerequisites](#prerequisites)
 - [Installation & Setup](#installation--setup)
@@ -62,52 +71,57 @@
 ## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                             REACT FRONTEND (Vite)                           │
-│  Chatbot UI  │  Live Engine Panel  │  Approval Cards  │  Pause/Resume UI    │
-└──────────────────────────────────────┬──────────────────────────────────────┘
-                                       │ HTTP / SSE Stream
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          FASTAPI BACKEND (api_server.py)                    │
-│  • Chat History Management          • Server-Sent Events (SSE) Stream       │
-│  • HITL Approval Endpoints          • Engine Lifecycle Manager              │
-│  • Local DB Search API              • Background Thread Coordinator         │
-└──────────────────────┬───────────────────────────────┬──────────────────────┘
-                       │                               │
-                       ▼                               ▼
-┌─────────────────────────────────────────┐  ┌────────────────────────────────┐
-│       MAIN AGENT (main_agent.py)        │  │       ENGINE MANAGER           │
-│  • LangGraph ReAct Agent Loop           │  │  • Thread Lifecycle Tracking  │
-│  • Groq LLM (gpt-oss-120b)              │  │  • Real-time Progress Queues   │
-│  • HITL Tool Interruption Mechanism     │  │  • Engine Cancellation Events │
-└──────────────────────┬──────────────────┘  └────────────────┬───────────────┘
-                       │                                      │
-                       ▼                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         LANGGRAPH EXECUTION PIPELINES                       │
-│  ┌─────────────────────────┐ ┌──────────────────────┐ ┌──────────────────┐  │
-│  │   Engine_query_input    │ │    Engine_ip_input   │ │ Engine_cve_input │  │
-│  │ Natural Language Target │ │ Targeted IP Scanning │ │ Pure CVE Research│  │
-│  └───────────┬─────────────┘ └──────────┬───────────┘ └─────────┬────────┘  │
-└──────────────┼──────────────────────────┼───────────────────────┼───────────┘
-               ▼                          ▼                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                             COLLECTION & ENRICHMENT                         │
-│  • query_gen_ai: Groq-powered Shodan search query generation                │
-│  • def_Shodan: Automated browser login & IP discovery / host scraper        │
-│  • def_nmap: 9-Phase full-spectrum Nmap scanner with phase checkpoints      │
-│  • cve_extractor: Regex and banner normalization for CVE discovery          │
-│  • cve_mapper: NIST NVD API v2 + Headless ChatGPT Playwright automation     │
-└──────────────────────────────────────┬──────────────────────────────────────┘
-                                       │
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          POSTGRESQL DATABASE (cti_db)                       │
-│  • CTI Data: hosts, scans, ports, vulnerabilities, technologies, cve_details│
-│  • Checkpoints: nmap_scan_checkpoints, checkpoints, checkpoint_blobs        │
-│  • Chat: chat_messages, tool_calls                                          │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                          REACT 19 FRONTEND (Vite)                                      │
+│  ┌─────────────────────────┐  ┌──────────────────────────┐  ┌───────────────────┐  ┌────────────────┐  │
+│  │ AI Chatbot (/ & /chat)  │  │ Threat Search (/search)  │  │ Host Intel (/ip)  │  │ Vuln Intel     │  │
+│  │ Live SSE Engine Tracker │  │ 43-Filter Shodan Dorks   │  │ Nmap+Shodan Tabs  │  │ Local Assets & │  │
+│  │ HITL Approval Cards     │  │ Dynamic Aggregations     │  │ ACK Firewall/SSL  │  │ ATT&CK Mapping │  │
+│  └─────────────────────────┘  └──────────────────────────┘  └───────────────────┘  └────────────────┘  │
+└───────────────────────────────────────────────────┬────────────────────────────────────────────────────┘
+                                                    │ HTTP REST / SSE Event Streams
+                                                    ▼
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                     FASTAPI BACKEND (api_server.py)                                    │
+│  • 17 REST & SSE Endpoints             • Server-Sent Events (SSE) Streaming • 43-Filter Dork Search   │
+│  • Human-in-the-Loop Interruption      • Background Engine Thread Manager   • Local CTI Data APIs      │
+└───────────────────────────┬───────────────────────────────────────────┬────────────────────────────────┘
+                            │                                           │
+                            ▼                                           ▼
+┌──────────────────────────────────────────────┐       ┌─────────────────────────────────────────────────┐
+│          MAIN AGENT (main_agent.py)          │       │         ENGINE MANAGER (engine_manager.py)      │
+│  • LangGraph ReAct Agent Loop                │       │  • Background Thread Coordination & Execution   │
+│  • Groq LLM (openai/gpt-oss-120b)            │       │  • Real-time SSE Event Queues (engine_progress) │
+│  • HITL Tool Interruption & Approval Gate    │       │  • Cooperative Thread Interruption & Pause/Stop │
+└───────────────────────────┬──────────────────┘       └────────────────────────┬────────────────────────┘
+                            │                                                   │
+                            ▼                                                   ▼
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                      LANGGRAPH RECON PIPELINES                                         │
+│  ┌───────────────────────────────────┐ ┌────────────────────────────────┐ ┌───────────────────────────┐  │
+│  │     Engine_query_input.py         │ │      Engine_ip_input.py        │ │    Engine_cve_input.py    │  │
+│  │ Natural Language Target Discovery │ │ Direct IP Reconnaissance       │ │ Pure Vulnerability        │  │
+│  │ Shodan Dorking -> Active Scans    │ │ Shodan Passive + 9-Phase Nmap  │ │ Research & ATT&CK Mapping │  │
+│  └─────────────────┬─────────────────┘ └───────────────┬────────────────┘ └─────────────┬─────────────┘  │
+└────────────────────┼───────────────────────────────────┼────────────────────────────────┼────────────────┘
+                     ▼                                   ▼                                ▼
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                        COLLECTION & ENRICHMENT                                         │
+│  • query_gen_ai: Groq-powered natural language to Shodan search query generator                       │
+│  • def_Shodan: Playwright Chromium authenticated scraper, cookie session pool, and diffing engine      │
+│  • def_nmap: 9-Phase full-spectrum Nmap engine with per-phase state checkpointing & ACK firewall audit │
+│  • cve_extractor: Regex and banner normalization for multi-port CVE extraction                        │
+│  • cve_mapper: Dual-source enrichment via NIST NVD API v2 + Playwright Headless ChatGPT account rotator│
+└───────────────────────────────────────────────────┬────────────────────────────────────────────────────┘
+                                                    │
+                                                    ▼
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                       POSTGRESQL DATABASE (cti_db)                                     │
+│  • CTI Intelligence: hosts, scans, ports, vulnerabilities, technologies, cve_details, affected_products│
+│  • AI & ATT&CK: cve_analysis (walkthroughs, mitigations, detection), cve_mitre_mappings (tactics, tech)│
+│  • Checkpoints: nmap_scan_checkpoints, checkpoints, checkpoint_blobs, checkpoint_writes                │
+│  • Chat & Session State: chat_messages, tool_calls                                                     │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -189,49 +203,97 @@ Located in [`Backend/cve_maper/`](file:///c:/Users/jassi/OneDrive/Documents/CTI_
 
 ## Web Applications & UI
 
-The frontend is located in [`Frontend/Chatbot/`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Frontend/Chatbot/):
+The frontend is located in [`Frontend/Chatbot/`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Frontend/Chatbot/) (see [Frontend Documentation](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Frontend/Chatbot/README.md) for full design guide):
 
-- **Cyberpunk Dark Interface**: High-contrast, sleek interface with glassmorphism panels, custom glowing indicators, and clean typography.
-- **Live Engine Progress Panel**:
-  - Displays each pipeline step: `Query Generation`, `IP Discovery`, `Shodan + Nmap Scanning`, `CVE Extraction`, `NVD + ChatGPT Enrichment`, and `Summary`.
-  - Shows dynamic per-phase Nmap status badges in real-time.
-- **Pause & Resume Controls**:
-  - Clicking **Stop** immediately signals backend threads and updates UI to *Pausing...*.
-  - When paused, an in-panel **Resume** button allows continuing execution from the last checkpoint.
-- **Human-in-the-Loop Dialog**: Modal approval cards for granting or declining tool execution.
-- **Chat Management**: Sidebar session manager with history persistence, creation of new investigations, and deletion.
+### 1. AI Threat Analyst Chat (`/` & `/chat`)
+- **Real-Time Token Streaming**: Agent thoughts and execution steps stream via Server-Sent Events (SSE) with GFM Markdown formatting.
+- **Human-in-the-Loop Cards**: Interactive authorization cards when the agent proposes active scans (`scan_natural_language_query`, `scan_ip_list`, `scan_cve_list`).
+- **Live Recon Engine Panel**: Visualizes pipeline stages (`Query Gen`, `IP Discovery`, `Parallel Scanning`, `CVE Extraction`, `NVD + AI Enrichment`, `Summary`) with per-phase Nmap status badges and pause/resume/stop buttons.
+- **Chat History Sidebar**: Persistent conversation switcher with thread creation, deletion, and local storage synchronization.
+
+### 2. Threat Search Engine (`/search`)
+- **43-Filter Shodan Search Engine**: Full query parser matching Shodan filter syntax across local PostgreSQL data:
+  - **General & Network**: `ip`, `net`, `port`, `asn`, `org`, `isp`, `hostname`, `has_ipv6`, `all`
+  - **Geographic**: `country`, `city`, `state`, `region`
+  - **Software & Device**: `product`, `version`, `os`, `cpe`, `tag`, `hash`
+  - **Vulnerability & Security**: `vuln`, `has_vuln`, `has_ssl`, `has_screenshot`
+  - **HTTP & Web-Server**: `http.component`, `http.component_category`, `http.title`, `http.status`, `http.waf`
+  - **SSL/TLS & Certificate**: `ssl`, `ssl.version`, `ssl.cert.subject.cn`, `ssl.cert.issuer.cn`, `ssl.ja3s`
+  - **SSH**: `ssh.fingerprint`
+- **Dynamic Facets Sidebar**: Real-time aggregations for Top Countries, Top Open Ports, and Top Organizations.
+- **Interactive Preset Chips**: Quick one-click filters for common searches (`port:22`, `port:80`, `port:443`, `has_vuln:true`, `has_ssl:true`, `product:openssh`).
+- **Host Intelligence Cards**: Clean result cards displaying IP address, geographic location, ASN/ISP, open port chips with service names, CVE count badges, and pagination.
+
+### 3. Host Intelligence Page (`/ip/:ip`)
+- **Hero Host Header**: IP address with copy button, reverse PTR hostnames, source presence badges (`Shodan` / `Nmap`), scan count, total CVEs, physical coordinates (`lat/lon`, postal, region), organization, ASN, OS, and Shodan tags.
+- **Tabbed Inspection Framework** (`?tab=all|shodan|nmap|vulns|timeline`):
+  - **Shodan Passive Recon**: Observation dates, `security.txt` responsible disclosure contact card, categorized web technology badges (frameworks, web servers), and banners.
+  - **Nmap Active Scanner**: Execution CLI command, uptime & TCP predictability, OS detection accuracy bars, traceroute network hops, and advanced NSE scripts:
+    - **ACK Firewall Posture (Phase 6)**: Evaluates whether the host is behind a stateful packet-filtering firewall (`Likely Firewalled` vs `Unfiltered`) with filtered ports count and ACK probe response breakdown.
+    - **DNS Reconnaissance**: Subdomain brute-forcing, PTR reverse lookup, and DNS zone transfer test results.
+    - **SSH Intelligence**: Host key fingerprints, allowed authentication methods, and supported ciphers/KEX/MAC algorithms.
+    - **SMB & Active Directory**: Domain name, forest, workgroup, exact OS build, and target system clock.
+    - **Layer-3/4 IP Protocols**: Discovered protocol support (ICMP, IGMP, GRE, ESP, AH).
+    - **Network Whois**: Registrant organization, CIDR blocks, and ASN records.
+    - **SSL/TLS Certificate Inspector**: Subject CN, Issuer, validity range (with EXPIRED tags), SAN domains, and SHA-1 fingerprint.
+    - **HTTP Security Headers Audit**: Validated headers (HSTS, CSP, X-Frame-Options, X-Content-Type-Options) and flagged missing defensive headers.
+  - **Aggregated Vulnerabilities Tab**: Severity filterable (Critical, High, Medium, Low) CVE list with CVSS vectors, summaries, affected port badges, and discovery source tags.
+  - **Scan Timeline Tab**: Historical snapshots showing each scan date, source engine, and per-port observation timestamps.
+
+### 4. Vulnerability Intelligence Page (`/cve/:cveId`)
+- **Comprehensive CVE Overview**: Executive title, CVSS v2/v3.1 base score, severity badge, attack vector metrics grid, and full CVSS vector string with copy button.
+- **Affected Local Assets & Scanned Hosts Card**:
+  - Automatically correlates the vulnerability with your local scanned hosts in PostgreSQL.
+  - Displays host IP (clickable link to `/ip/:ip`), vulnerable port/protocol, discovery source (`nmap` / `shodan`), and direct action button *"View Host Intelligence →"*.
+  - Displays a clean green reassurance badge when no local assets are affected.
+- **Weakness Taxonomy (CWE)**: Official MITRE CWE identifier, title, and link.
+- **Threat & Exploit Telemetry**: CISA KEV exploitation status, public exploit/PoC availability, and Exploit-DB/GitHub references.
+- **Adversary MITRE ATT&CK Matrix**: Tactical mapping (TA0001–TA0043) and techniques (T1190, T1059, etc.) with technical justification.
+- **Technical Walkthrough & Mitigations**: Step-by-step vulnerability walkthrough, verified remediation checklist, and threat hunting Snort/Suricata rules.
+- **Affected Products (CPE)**: Filterable table of affected vendor software and versions from NIST NVD.
+- **Raw Payloads Viewer**: Collapsible JSON inspector for underlying NVD and AI response payloads.
+
+### 5. Cyberpunk 404 Error Page (`*`)
+- Terminal-inspired route fallback with automated redirection controls.
 
 ---
 
 ## API Reference
 
-The FastAPI backend runs at `http://localhost:8000` ([`Backend/api_server.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/api_server.py)):
+The FastAPI backend runs at `http://localhost:8000` ([`Backend/api_server.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/api_server.py)). Interactive OpenAPI documentation is available at `http://localhost:8000/docs`.
 
-### Chat & Agent
+### Chat & AI Agent Endpoints (7)
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/chats/new` | Creates a new chat session thread. |
-| `GET` | `/api/chats` | Lists all chat session histories. |
-| `GET` | `/api/chats/{thread_id}` | Retrieves messages for a specific conversation. |
-| `DELETE` | `/api/chats/{thread_id}` | Deletes a chat session and clears related tool calls. |
-| `POST` | `/api/chats/{thread_id}/message` | Sends user prompt and streams tokens and tool events via SSE. |
-| `POST` | `/api/chats/{thread_id}/approve` | Submits Human-in-the-Loop decision (`{"action": "accept"|"decline"}`). |
+| `GET` | `/api/chats` | Lists all chat session histories with preview messages. |
+| `GET` | `/api/chats/{thread_id}` | Retrieves all messages, message indices, and tool states for a conversation. |
+| `DELETE` | `/api/chats/{thread_id}` | Deletes a conversation and clears associated tool calls. |
+| `POST` | `/api/chats/{thread_id}/message` | Sends user prompt and streams LLM tokens and tool calls via SSE. |
+| `POST` | `/api/chats/{thread_id}/approve` | Submits Human-in-the-Loop authorization decision (`{"action": "accept"|"decline"}`). |
 | `POST` | `/api/chats/{thread_id}/stop` | Cancels an ongoing agent reasoning stream. |
 
-### Engine Lifecycle & Streaming
+### Engine Lifecycle & Streaming Endpoints (4)
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/engine/{engine_thread_id}/stream` | SSE stream for real-time progress events of a running engine. |
-| `POST` | `/api/engine/{engine_thread_id}/stop` | Pauses/stops a running background engine. |
-| `POST` | `/api/engine/{engine_thread_id}/resume` | Resumes a paused engine from its latest checkpoint. |
-| `GET` | `/api/chats/{thread_id}/engines` | Lists running and paused engines associated with a chat. |
+| `GET` | `/api/engine/{engine_thread_id}/stream` | Server-Sent Events (SSE) stream for real-time progress events of a running engine. |
+| `POST` | `/api/engine/{engine_thread_id}/stop` | Pauses/stops a running background engine cooperatively. |
+| `POST` | `/api/engine/{engine_thread_id}/resume` | Resumes a paused engine from its latest phase checkpoint. |
+| `GET` | `/api/chats/{thread_id}/engines` | Lists running and paused scanning engines associated with a chat. |
 
-### Local Intelligence Search
+### Threat Search & OSINT Intelligence Endpoints (4)
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/search/ip/{ip}` | Retrieves all host details, scan history, ports, and CVEs for an IP. |
-| `GET` | `/api/search/cve/{cve_id}` | Retrieves full NVD metrics, CPEs, and ChatGPT MITRE analysis for a CVE. |
+| `GET` | `/api/search/filters` | Returns all 43 supported Shodan search filters grouped by category. |
+| `GET` | `/api/search` | Queries local database using Shodan filter syntax (`?q=...&page=1&page_size=20`). |
+| `GET` | `/api/search/ip/{ip_address}` | Retrieves full host intelligence (Shodan passive, Nmap active, ACK firewall, SSL, CVEs). |
+| `GET` | `/api/search/cve/{cve_id}` | Retrieves full NVD metrics, CPEs, ChatGPT ATT&CK analysis, and **affected local assets**. |
+
+### System & Health Endpoints (2)
+| Method | Endpoint | Description |
+|---|---|---|
 | `GET` | `/api/stats` | Returns database statistics (total hosts, scans, ports, CVEs). |
+| `GET` | `/api/health` | Health check endpoint returning system status and database connectivity. |
 
 ---
 
@@ -398,15 +460,16 @@ CTI_V2/
 ├── .env.example                      # Sample configuration template
 ├── pyproject.toml                    # Python project configuration & dependencies
 ├── uv.lock                           # Locked dependency resolution
-├── README.md                         # Platform documentation
+├── README.md                         # Platform root documentation
 │
-├── Backend/
-│   ├── api_server.py                 # FastAPI REST and SSE streaming server
+├── Backend/                          # Python FastAPI & LangGraph backend
+│   ├── README.md                     # Backend modular documentation
+│   ├── api_server.py                 # FastAPI REST (17 endpoints) and SSE streaming server
 │   ├── main_agent.py                 # LangGraph ReAct agent with HITL approval
 │   ├── engine_manager.py             # Background engine lifecycle manager
 │   ├── engine_progress.py            # Real-time progress queues & cancel events
-│   ├── db_manager.py                 # Core CTI PostgreSQL schema & query logic
-│   ├── chat_persistence.py           # Chat history & tool call tracking tables
+│   ├── db_manager.py                 # Core CTI PostgreSQL schema (10 tables) & query logic
+│   ├── chat_persistence.py           # Chat history & tool call tracking (3 tables)
 │   ├── cve_extractor.py              # Service banner & output CVE extractor
 │   │
 │   ├── Engine_query_input.py         # Full Natural Language Query LangGraph engine
@@ -431,13 +494,22 @@ CTI_V2/
 │
 └── Frontend/
     └── Chatbot/                      # React 19 + Vite Frontend Application
+        ├── README.md                 # Frontend design system & routes documentation
         ├── src/
-        │   ├── App.jsx               # Chat interface, live engine panel, HITL modal
-        │   ├── App.css               # Styling, animations, cyberpunk theme
-        │   ├── main.jsx              # Application entry point
-        │   └── index.css             # Base styles & CSS variables
+        │   ├── App.jsx               # AI Chat interface, live engine panel, HITL modal
+        │   ├── App.css               # Chat styling, animations, cyberpunk theme
+        │   ├── SearchPage.css        # Scoped stylesheet for search & intelligence views
+        │   ├── index.css             # Base styles & CSS design tokens
+        │   ├── main.jsx              # React DOM entry point & Router configuration
+        │   │
+        │   └── pages/                # Modular page views
+        │       ├── SearchPage.jsx    # 43-Filter Shodan threat search & facet aggregations
+        │       ├── IpDetailPage.jsx  # Deep host inspection (Nmap + Shodan + ACK firewall)
+        │       ├── CveDetailPage.jsx # CVE telemetry, ATT&CK mapping & local affected assets
+        │       └── NotFoundPage.jsx  # Cyberpunk-styled 404 error page
+        │
         ├── package.json              # Frontend dependencies & scripts
-        └── vite.config.js            # Vite configuration
+        └── vite.config.js            # Vite configuration & proxy settings
 ```
 
 ---

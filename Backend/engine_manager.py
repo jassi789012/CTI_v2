@@ -120,14 +120,12 @@ class EngineManager:
             RuntimeError: If an engine is already running for this chat.
         """
         with self._lock:
-            # Check if an engine is already running for this chat
-            existing = self._chat_engines.get(chat_thread_id)
-            if existing and existing in self._engines:
-                rec = self._engines[existing]
-                if rec.status == "running":
+            # Check if any engine is already running for this chat
+            for eid, rec in self._engines.items():
+                if rec.chat_thread_id == chat_thread_id and rec.status == "running":
                     raise RuntimeError(
-                        f"Engine '{existing}' is already running for chat '{chat_thread_id}'. "
-                        "Stop it first before starting a new one."
+                        f"An engine is already running in this chat ('{eid}'). "
+                        "Pause it first before starting a new one."
                     )
 
             record = EngineRecord(
@@ -215,7 +213,8 @@ class EngineManager:
                 pass
 
         except InterruptedError:
-            record.status = "paused"
+            if record.status != "stopped":
+                record.status = "paused"
             record.progress_queue.put({
                 "type": "engine_paused",
                 "engine_thread_id": engine_tid,
@@ -250,9 +249,11 @@ class EngineManager:
 
         finally:
             clear_context()
-            # Clean up the override
+            # Clean up the override only if not paused or stopped
             _progress_queues.pop(chat_tid, None)
-            _cancel_events.pop(chat_tid, None)
+            if record.status not in ("paused", "stopped"):
+                _cancel_events.pop(chat_tid, None)
+                _cancel_events_by_engine.pop(engine_tid, None)
 
     def _build_summary(self, engine_type: str, result: dict) -> str:
         """Build a human-readable summary from engine results."""
@@ -297,6 +298,16 @@ class EngineManager:
             )
         except Exception:
             pass
+        try:
+            from def_nmap.nmap_scanner import cancel_nmap_scanners
+            cancel_nmap_scanners(engine_thread_id)
+        except Exception:
+            pass
+        try:
+            from def_Shodan.get_ip_info import cancel_shodan_scraper
+            cancel_shodan_scraper(engine_thread_id)
+        except Exception:
+            pass
 
     def resume_engine(self, engine_thread_id: str, chat_thread_id: str) -> EngineRecord | None:
         """Resume a paused engine by starting a new background thread.
@@ -309,10 +320,10 @@ class EngineManager:
             try:
                 from chat_persistence import ChatDB
                 db = ChatDB()
-                paused_tools = db.get_paused_tools(chat_thread_id)
+                all_tools = db.get_tool_calls(chat_thread_id)
                 db.close()
                 
-                for tc in paused_tools:
+                for tc in all_tools:
                     if tc.get("engine_thread_id") == engine_thread_id:
                         record = EngineRecord(
                             engine_type=self._infer_engine_type(tc["tool_name"]),
@@ -328,31 +339,44 @@ class EngineManager:
         if not record:
             return None
 
-        # Reset the record for a fresh run
-        record.cancel_event = threading.Event()
-        record.progress_queue = queue_module.Queue()
-        record.status = "running"
-        record.error = None
-
-        try:
-            from engine_progress import _cancel_events, _cancel_events_by_engine
-            _cancel_events_by_engine[engine_thread_id] = record.cancel_event
-            _cancel_events[chat_thread_id] = record.cancel_event
-        except Exception:
-            pass
-
         with self._lock:
+            # Check if any other engine is already running for this chat
+            for eid, rec in self._engines.items():
+                if rec.chat_thread_id == chat_thread_id and eid != engine_thread_id and rec.status == "running":
+                    raise RuntimeError(
+                        f"An engine is already running in this chat ('{eid}'). "
+                        "Pause it first before resuming another engine."
+                    )
+
+            # Reset the record for a fresh run
+            record.cancel_event = threading.Event()
+            record.progress_queue = queue_module.Queue()
+            record.status = "running"
+            record.error = None
+
+            try:
+                from engine_progress import _cancel_events, _cancel_events_by_engine
+                _cancel_events_by_engine[engine_thread_id] = record.cancel_event
+                _cancel_events[chat_thread_id] = record.cancel_event
+            except Exception:
+                pass
+
             self._engines[engine_thread_id] = record
             self._chat_engines[chat_thread_id] = engine_thread_id
 
-        # Update DB
+        # Update DB: mark this engine as running, and any other running tool as paused
         try:
             from chat_persistence import ChatDB
             db = ChatDB()
             with db.conn.cursor() as cur:
                 cur.execute(
+                    """UPDATE tool_calls SET status = 'paused', updated_at = NOW()
+                       WHERE thread_id = %s AND engine_thread_id != %s AND status = 'running'""",
+                    (chat_thread_id, engine_thread_id),
+                )
+                cur.execute(
                     """UPDATE tool_calls SET status = 'running', updated_at = NOW()
-                       WHERE engine_thread_id = %s AND status = 'paused'""",
+                       WHERE engine_thread_id = %s""",
                     (engine_thread_id,),
                 )
             db.close()
@@ -395,20 +419,18 @@ class EngineManager:
 
     def is_engine_running(self, chat_thread_id: str) -> bool:
         """Check if any engine is currently running for a chat."""
-        engine_tid = self._chat_engines.get(chat_thread_id)
-        if not engine_tid:
-            return False
-        record = self._engines.get(engine_tid)
-        return record is not None and record.status == "running"
+        with self._lock:
+            for eid, rec in self._engines.items():
+                if rec.chat_thread_id == chat_thread_id and rec.status == "running":
+                    return True
+        return False
 
     def get_running_engine(self, chat_thread_id: str) -> EngineRecord | None:
         """Get the currently running engine for a chat, if any."""
-        engine_tid = self._chat_engines.get(chat_thread_id)
-        if not engine_tid:
-            return None
-        record = self._engines.get(engine_tid)
-        if record and record.status == "running":
-            return record
+        with self._lock:
+            for eid, rec in self._engines.items():
+                if rec.chat_thread_id == chat_thread_id and rec.status == "running":
+                    return rec
         return None
 
     def list_engines_for_chat(self, chat_thread_id: str) -> list[dict]:
@@ -442,8 +464,48 @@ class EngineManager:
         except Exception:
             return []
 
+    def stop_all_engines_for_chat(self, chat_thread_id: str) -> list[str]:
+        """Stop and cancel all engines associated with a chat session.
+        
+        Returns the list of engine_thread_ids that were stopped.
+        """
+        from engine_progress import cancel_engine
+
+        # Signal cancellation for chat-level events
+        cancel_engine(chat_thread_id=chat_thread_id)
+
+        stopped_ids = []
+        with self._lock:
+            # Find all engine records matching this chat
+            target_eids = [
+                eid for eid, rec in self._engines.items()
+                if rec.chat_thread_id == chat_thread_id
+            ]
+            # Also include the mapped engine in _chat_engines if any
+            mapped_eid = self._chat_engines.pop(chat_thread_id, None)
+            if mapped_eid and mapped_eid not in target_eids:
+                target_eids.append(mapped_eid)
+
+            for eid in target_eids:
+                stopped_ids.append(eid)
+                rec = self._engines.get(eid)
+                if rec:
+                    rec.cancel_event.set()
+                    rec.status = "stopped"
+                    cancel_engine(chat_thread_id=chat_thread_id, engine_thread_id=eid)
+                    try:
+                        rec.progress_queue.put({
+                            "type": "engine_paused",
+                            "engine_thread_id": eid,
+                            "error": "Engine stopped because chat was deleted",
+                        })
+                    except Exception:
+                        pass
+                else:
+                    cancel_engine(engine_thread_id=eid)
+
+        return stopped_ids
+
     def stop_engine_for_chat(self, chat_thread_id: str):
         """Stop whatever engine is running for a chat."""
-        engine_tid = self._chat_engines.get(chat_thread_id)
-        if engine_tid:
-            self.pause_engine(engine_tid)
+        return self.stop_all_engines_for_chat(chat_thread_id)

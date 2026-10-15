@@ -148,7 +148,7 @@ def process_all_ips_node(state: EngineState, config: RunnableConfig) -> dict:
             except Exception:
                 pass
         try:
-            for progress in get_ip_info_gen(ips):
+            for progress in get_ip_info_gen(ips, engine_thread_id=thread_id):
                 if is_cancelled(engine_thread_id=thread_id):
                     break
                 q.put(progress)
@@ -192,6 +192,18 @@ def process_all_ips_node(state: EngineState, config: RunnableConfig) -> dict:
     
     while finished_threads < 2:
         if is_cancelled(engine_thread_id=thread_id):
+            try:
+                from def_Shodan.get_ip_info import cancel_shodan_scraper
+                cancel_shodan_scraper(thread_id)
+            except Exception:
+                pass
+            try:
+                from def_nmap.nmap_scanner import cancel_nmap_scanners
+                cancel_nmap_scanners(thread_id)
+            except Exception:
+                pass
+            t1.join(timeout=1.0)
+            t2.join(timeout=1.0)
             raise InterruptedError("Engine cancelled by user")
             
         try:

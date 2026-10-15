@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Plus, MessageSquare, Send, Activity, ShieldAlert, CheckCircle2, ChevronRight, TerminalSquare, Trash2, Square, Clock, Pause, Play, X, AlertTriangle } from 'lucide-react'
+import { Plus, MessageSquare, Send, Activity, ShieldAlert, CheckCircle2, ChevronRight, TerminalSquare, Trash2, Square, Clock, Pause, Play, X, AlertTriangle, Search } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import './App.css'
@@ -49,24 +50,63 @@ export default function App() {
   // Engine tracking state
   const [activeEngine, setActiveEngine] = useState(null)  // {engine_thread_id, engine_name, tool, nodes}
   const engineEventSourceRef = useRef(null)
+  const streamAbortControllerRef = useRef(null)
 
-  // Resume dialog state
-  const [resumeDialog, setResumeDialog] = useState(null)  // {engines: [...paused engines]}
+  // Engines sidebar state
+  const [enginesList, setEnginesList] = useState([])
+  const [isRightPanelOpen, setIsRightPanelOpen] = useState(true)
+  const activeEngineRef = useRef(activeEngine)
+  useEffect(() => { activeEngineRef.current = activeEngine }, [activeEngine])
+
+  // Conflict alert dialog state
+  const [engineConflictAlert, setEngineConflictAlert] = useState(null)
+
+  // Helper: check if any engine is currently running in this chat
+  const getRunningEngine = () => {
+    if (activeEngine && (activeEngine.status === 'running' || activeEngine.status === 'pausing')) {
+      return activeEngine
+    }
+    const fromList = enginesList.find(e => e.status === 'running' || e.status === 'pausing')
+    if (fromList) return fromList
+    for (const msg of messages) {
+      if (msg.tools) {
+        const t = msg.tools.find(tool => tool.status === 'running' || tool.status === 'pausing')
+        if (t) return t
+      }
+    }
+    return null
+  }
 
   const messagesEndRef = useRef(null)
+  const chatAreaRef = useRef(null)
+  const isNearBottomRef = useRef(true)
 
-  // Auto-scroll to bottom of chat
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  const handleChatScroll = () => {
+    if (!chatAreaRef.current) return
+    const { scrollTop, scrollHeight, clientHeight } = chatAreaRef.current
+    // User is near bottom if within 150px of the bottom
+    isNearBottomRef.current = scrollHeight - scrollTop - clientHeight < 150
   }
-  useEffect(() => {
-    scrollToBottom()
-  }, [messages, activeEngine])
 
-  // Load chat sessions on mount
+  // Auto-scroll to bottom of chat only if user is already near bottom or forced
+  const scrollToBottom = (force = false) => {
+    if (force || isNearBottomRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+  }
+
+  useEffect(() => {
+    scrollToBottom(false)
+  }, [messages])
+
+  // Load chat sessions on mount and set title
   useEffect(() => {
     fetchSessions()
   }, [])
+
+  useEffect(() => {
+    document.title = activeThreadId ? `${activeThreadId} | CTI Agent` : 'CTI Agent — Threat Intelligence'
+  }, [activeThreadId])
 
   // Cleanup engine SSE on unmount
   useEffect(() => {
@@ -88,11 +128,17 @@ export default function App() {
   }
 
   const handleNewChat = async () => {
-    // Disconnect from any running engine SSE
+    // Abort any active response stream & engine SSE
+    if (streamAbortControllerRef.current) {
+      streamAbortControllerRef.current.abort()
+      streamAbortControllerRef.current = null
+    }
+    setIsStreaming(false)
     disconnectEngineStream()
     setPendingApproval(null)
-    setResumeDialog(null)
     setActiveEngine(null)
+    setEnginesList([])
+    isNearBottomRef.current = true
 
     try {
       const res = await fetch(`${API_BASE}/chats/new`, { method: 'POST' })
@@ -106,32 +152,55 @@ export default function App() {
   }
 
   const loadChat = async (threadId) => {
-    // Disconnect from any running engine SSE
+    // Abort any active response stream & engine SSE
+    if (streamAbortControllerRef.current) {
+      streamAbortControllerRef.current.abort()
+      streamAbortControllerRef.current = null
+    }
+    setIsStreaming(false)
     disconnectEngineStream()
     setPendingApproval(null)
-    setResumeDialog(null)
     setActiveEngine(null)
+    isNearBottomRef.current = true
 
     setActiveThreadId(threadId)
     try {
-      const res = await fetch(`${API_BASE}/chats/${threadId}`)
-      const data = await res.json()
+      const [chatRes, enginesRes] = await Promise.all([
+        fetch(`${API_BASE}/chats/${threadId}`),
+        fetch(`${API_BASE}/chats/${threadId}/engines`),
+      ])
+      const data = await chatRes.json()
+      const enginesData = await enginesRes.json()
       
       const rawMessages = data.messages || data
       const toolCalls = data.tool_calls || []
-      
+
       // Build a map of message_index -> tool_calls
       const toolsByMsgIdx = {}
       toolCalls.forEach(tc => {
-        const idx = tc.message_index
+        let idx = tc.message_index
+        if (idx === null || idx === undefined) {
+          // Fallback: match assistant message by engine_thread_id in content or default to first assistant
+          const matchIdx = rawMessages.findIndex(m => m.role === 'assistant' && m.content && tc.engine_thread_id && m.content.includes(tc.engine_thread_id))
+          if (matchIdx !== -1) {
+            idx = rawMessages[matchIdx].message_index
+          } else {
+            const firstAsst = rawMessages.find(m => m.role === 'assistant')
+            idx = firstAsst ? firstAsst.message_index : 0
+          }
+        }
+
         if (idx !== null && idx !== undefined) {
           if (!toolsByMsgIdx[idx]) toolsByMsgIdx[idx] = []
           toolsByMsgIdx[idx].push({
             name: tc.tool_name,
+            tool_name: tc.tool_name,
             input: tc.input_data,
-            status: tc.status === 'paused' ? 'paused' : tc.status === 'done' ? 'done' : tc.status === 'error' ? 'done' : 'done',
+            input_data: tc.input_data,
+            status: tc.status || 'done',
             output: tc.result_summary,
             engine_id: tc.engine_thread_id,
+            engine_thread_id: tc.engine_thread_id,
             tool_call_id: tc.tool_call_id,
             nodes: tc.progress || {},
           })
@@ -147,12 +216,37 @@ export default function App() {
       })
       
       setMessages(mergedMessages)
+      setEnginesList(enginesData?.engines || [])
 
-      // Check for running or paused engines
-      await checkEngineStatus(threadId)
+      // Apply engine status (approval card or live stream)
+      applyEngineStatus(enginesData)
 
     } catch (err) {
       console.error("Failed to load chat", err)
+    }
+  }
+
+  const applyEngineStatus = (data) => {
+    if (!data) return
+
+    // If there's a pending tool approval (agent is waiting for human decision),
+    // show the approval card — even after server restart
+    if (data.pending_approval) {
+      setPendingApproval(data.pending_approval)
+      return
+    }
+
+    // If an engine is currently running, connect to its SSE stream
+    if (data.has_running && data.running_engine_thread_id) {
+      const runningEngine = data.engines?.find(e => e.engine_thread_id === data.running_engine_thread_id)
+      if (runningEngine) {
+        connectToEngineStream(
+          data.running_engine_thread_id,
+          ENGINE_DISPLAY_NAMES[runningEngine.tool_name] || runningEngine.tool_name,
+          runningEngine.tool_name,
+          runningEngine.progress || {}
+        )
+      }
     }
   }
 
@@ -160,33 +254,7 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/chats/${threadId}/engines`)
       const data = await res.json()
-
-      // If there's a pending tool approval (agent is waiting for human decision),
-      // show the approval card — even after server restart
-      if (data.pending_approval) {
-        setPendingApproval(data.pending_approval)
-        return
-      }
-
-      // If an engine is currently running, connect to its SSE stream
-      if (data.has_running && data.running_engine_thread_id) {
-        const runningEngine = data.engines.find(e => e.engine_thread_id === data.running_engine_thread_id)
-        if (runningEngine) {
-          connectToEngineStream(
-            data.running_engine_thread_id,
-            ENGINE_DISPLAY_NAMES[runningEngine.tool_name] || runningEngine.tool_name,
-            runningEngine.tool_name,
-            runningEngine.progress || {}
-          )
-        }
-        return
-      }
-
-      // If there are paused/incomplete engines, show resume dialog
-      const pausedEngines = data.engines.filter(e => e.status === 'paused')
-      if (pausedEngines.length > 0) {
-        setResumeDialog({ engines: pausedEngines })
-      }
+      applyEngineStatus(data)
     } catch (err) {
       console.error("Failed to check engine status", err)
     }
@@ -204,6 +272,11 @@ export default function App() {
     const nodeStates = {}
     toolNodeList.forEach(n => {
       nodeStates[n.key] = initialNodes[n.key] || { status: 'pending', detail: '' }
+    })
+    Object.keys(initialNodes || {}).forEach(k => {
+      if (!nodeStates[k]) {
+        nodeStates[k] = initialNodes[k]
+      }
     })
 
     setActiveEngine({
@@ -250,6 +323,25 @@ export default function App() {
         })
         return { ...prev, nodes, status: 'done' }
       })
+      setEnginesList(prev => prev.map(e => 
+        ((e.engine_thread_id || e.engine_id) === engineThreadId) ? { ...e, status: 'done' } : e
+      ))
+      setMessages(prev => prev.map(msg => {
+        if (!msg.tools) return msg
+        return {
+          ...msg,
+          tools: msg.tools.map(t => {
+            if ((t.engine_thread_id || t.engine_id) === engineThreadId) {
+              const updatedNodes = { ...(t.nodes || {}) }
+              Object.keys(updatedNodes).forEach(k => {
+                updatedNodes[k] = { ...updatedNodes[k], status: 'done' }
+              })
+              return { ...t, status: 'done', nodes: updatedNodes }
+            }
+            return t
+          })
+        }
+      }))
       evtSource.close()
       engineEventSourceRef.current = null
     }
@@ -265,12 +357,48 @@ export default function App() {
         })
         return { ...prev, nodes, status: 'paused' }
       })
+      setEnginesList(prev => prev.map(e => 
+        ((e.engine_thread_id || e.engine_id) === engineThreadId) ? { ...e, status: 'paused' } : e
+      ))
+      setMessages(prev => prev.map(msg => {
+        if (!msg.tools) return msg
+        return {
+          ...msg,
+          tools: msg.tools.map(t => {
+            if ((t.engine_thread_id || t.engine_id) === engineThreadId) {
+              const updatedNodes = { ...(t.nodes || {}) }
+              Object.keys(updatedNodes).forEach(k => {
+                if (updatedNodes[k].status === 'running') {
+                  updatedNodes[k] = { ...updatedNodes[k], status: 'paused' }
+                }
+              })
+              return { ...t, status: 'paused', nodes: updatedNodes }
+            }
+            return t
+          })
+        }
+      }))
       evtSource.close()
       engineEventSourceRef.current = null
     }
 
     const handleErrorEvent = (data) => {
       setActiveEngine(prev => prev ? { ...prev, status: 'error', error: data.error || 'Unknown error' } : prev)
+      setEnginesList(prev => prev.map(e => 
+        ((e.engine_thread_id || e.engine_id) === engineThreadId) ? { ...e, status: 'error' } : e
+      ))
+      setMessages(prev => prev.map(msg => {
+        if (!msg.tools) return msg
+        return {
+          ...msg,
+          tools: msg.tools.map(t => {
+            if ((t.engine_thread_id || t.engine_id) === engineThreadId) {
+              return { ...t, status: 'error', error: data.error || 'Unknown error' }
+            }
+            return t
+          })
+        }
+      }))
       evtSource.close()
       engineEventSourceRef.current = null
     }
@@ -324,28 +452,51 @@ export default function App() {
 
   const handleDeleteChat = async (threadId, e) => {
     e.stopPropagation()
-    // Stop any running engine for this chat first
+
+    if (!window.confirm(`Are you sure you want to delete investigation "${threadId}"? This will terminate any running operations for this chat.`)) {
+      return
+    }
+
+    const isCurrentActive = activeThreadId === threadId
+
+    // 1. Immediately tear down local stream & states if deleting current active chat
+    if (isCurrentActive) {
+      if (streamAbortControllerRef.current) {
+        streamAbortControllerRef.current.abort()
+        streamAbortControllerRef.current = null
+      }
+      disconnectEngineStream()
+      setIsStreaming(false)
+      setActiveEngine(null)
+      setActiveThreadId(null)
+      setMessages([])
+      setPendingApproval(null)
+      setEnginesList([])
+    }
+
+    // 2. Optimistically remove from sidebar
+    setSessions(prev => prev.filter(s => s.thread_id !== threadId))
+
+    // 3. Proactively signal stop to backend agent & running engines
     try {
+      fetch(`${API_BASE}/chats/${threadId}/stop`, { method: 'POST' }).catch(() => {})
+      
       const enginesRes = await fetch(`${API_BASE}/chats/${threadId}/engines`)
-      const enginesData = await enginesRes.json()
-      if (enginesData.has_running && enginesData.running_engine_thread_id) {
-        await fetch(`${API_BASE}/engine/${enginesData.running_engine_thread_id}/stop`, { method: 'POST' })
+      if (enginesRes.ok) {
+        const enginesData = await enginesRes.json()
+        if (enginesData.has_running && enginesData.running_engine_thread_id) {
+          fetch(`${API_BASE}/engine/${enginesData.running_engine_thread_id}/stop`, { method: 'POST' }).catch(() => {})
+        }
       }
     } catch {}
 
+    // 4. Send DELETE request (backend stops all engines, cancels events, and cleans checkpoints)
     try {
       await fetch(`${API_BASE}/chats/${threadId}`, { method: 'DELETE' })
-      if (activeThreadId === threadId) {
-        disconnectEngineStream()
-        setActiveThreadId(null)
-        setMessages([])
-        setActiveEngine(null)
-        setPendingApproval(null)
-        setResumeDialog(null)
-      }
-      fetchSessions()
     } catch (err) {
       console.error("Failed to delete chat", err)
+    } finally {
+      fetchSessions()
     }
   }
 
@@ -354,12 +505,17 @@ export default function App() {
   // ─────────────────────────────────────────────────────────────────────────
 
   const handleStopAgent = async () => {
+    if (streamAbortControllerRef.current) {
+      streamAbortControllerRef.current.abort()
+      streamAbortControllerRef.current = null
+    }
     if (!activeThreadId || !isStreaming) return
     try {
       await fetch(`${API_BASE}/chats/${activeThreadId}/stop`, { method: 'POST' })
-      setIsStreaming(false)
     } catch (err) {
       console.error("Failed to stop agent", err)
+    } finally {
+      setIsStreaming(false)
     }
   }
 
@@ -367,14 +523,58 @@ export default function App() {
   // Engine Stop
   // ─────────────────────────────────────────────────────────────────────────
 
-  const handleStopEngine = async () => {
-    if (!activeEngine || (activeEngine.status !== 'running' && activeEngine.status !== 'pausing')) return
-    setActiveEngine(prev => prev ? { ...prev, status: 'pausing' } : prev)
+  const handleStopEngine = async (targetEngine = null) => {
+    const engineObj = (targetEngine && (targetEngine.engine_thread_id || targetEngine.engine_id))
+      ? targetEngine
+      : activeEngine
+    const engineThreadId = engineObj?.engine_thread_id || engineObj?.engine_id
+    if (!engineThreadId) return
+
+    if (activeEngine && (activeEngine.engine_thread_id === engineThreadId)) {
+      setActiveEngine(prev => prev ? { ...prev, status: 'pausing' } : prev)
+    }
+    setEnginesList(prev => prev.map(e => 
+      ((e.engine_thread_id || e.engine_id) === engineThreadId)
+        ? { ...e, status: 'pausing' }
+        : e
+    ))
+    setMessages(prev => prev.map(msg => {
+      if (!msg.tools) return msg
+      return {
+        ...msg,
+        tools: msg.tools.map(t => {
+          if ((t.engine_thread_id || t.engine_id) === engineThreadId) {
+            return { ...t, status: 'pausing' }
+          }
+          return t
+        })
+      }
+    }))
+
     try {
-      await fetch(`${API_BASE}/engine/${activeEngine.engine_thread_id}/stop`, { method: 'POST' })
+      await fetch(`${API_BASE}/engine/${engineThreadId}/stop`, { method: 'POST' })
     } catch (err) {
       console.error("Failed to stop engine", err)
-      setActiveEngine(prev => prev ? { ...prev, status: 'running' } : prev)
+      if (activeEngine && (activeEngine.engine_thread_id === engineThreadId)) {
+        setActiveEngine(prev => prev ? { ...prev, status: 'running' } : prev)
+      }
+      setEnginesList(prev => prev.map(e => 
+        ((e.engine_thread_id || e.engine_id) === engineThreadId)
+          ? { ...e, status: 'running' }
+          : e
+      ))
+      setMessages(prev => prev.map(msg => {
+        if (!msg.tools) return msg
+        return {
+          ...msg,
+          tools: msg.tools.map(t => {
+            if ((t.engine_thread_id || t.engine_id) === engineThreadId) {
+              return { ...t, status: 'running' }
+            }
+            return t
+          })
+        }
+      }))
     }
   }
 
@@ -384,17 +584,41 @@ export default function App() {
 
   const handleApproval = async (action) => {
     if (!activeThreadId || !pendingApproval) return
+
+    if (action === 'accept') {
+      const running = getRunningEngine()
+      if (running) {
+        setEngineConflictAlert("Already one engine is running in this chat. Pause it first to run a second engine.")
+        return
+      }
+    }
+
     setPendingApproval(null)
 
     setMessages(prev => [...prev, { role: 'assistant', content: '', tools: [] }])
     setIsStreaming(true)
 
+    if (streamAbortControllerRef.current) {
+      streamAbortControllerRef.current.abort()
+    }
+    const controller = new AbortController()
+    streamAbortControllerRef.current = controller
+
     try {
       const response = await fetch(`${API_BASE}/chats/${activeThreadId}/approve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action })
+        body: JSON.stringify({ action }),
+        signal: controller.signal
       })
+
+      if (!response.ok) {
+        let errData = null
+        try { errData = await response.json() } catch {}
+        setEngineConflictAlert(errData?.detail || "Already one engine is running in this chat. Pause it first to run a second engine.")
+        setMessages(prev => prev.slice(0, prev.length - 1))
+        return
+      }
 
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
@@ -421,9 +645,23 @@ export default function App() {
         }
       }
     } catch (err) {
+      if (err.name === 'AbortError') return
       console.error("Approval stream error", err)
+      setMessages(prev => {
+        if (prev.length === 0) return prev
+        const copy = [...prev]
+        const last = { ...copy[copy.length - 1] }
+        if (last.role === 'assistant' && !last.content) {
+          last.content = `⚠️ **Connection Error:** Could not stream approval decision (${err.message || 'Network error'}).`
+          copy[copy.length - 1] = last
+        }
+        return copy
+      })
     } finally {
       setIsStreaming(false)
+      if (streamAbortControllerRef.current === controller) {
+        streamAbortControllerRef.current = null
+      }
     }
   }
 
@@ -432,18 +670,62 @@ export default function App() {
   // ─────────────────────────────────────────────────────────────────────────
 
   const handleResumeEngine = async (engine) => {
-    setResumeDialog(null)
+    const engineThreadId = engine.engine_thread_id || engine.engine_id
+    if (!engineThreadId) {
+      console.error("Cannot resume engine: missing engine thread ID", engine)
+      return
+    }
 
-    const toolName = engine.tool_name || engine.tool
+    const running = getRunningEngine()
+    if (running && (running.engine_thread_id || running.engine_id) !== engineThreadId) {
+      setEngineConflictAlert("Already one engine is running in this chat. Pause it first before resuming another engine.")
+      return
+    }
+
+    const toolName = engine.tool_name || engine.tool || engine.name
     const displayName = ENGINE_DISPLAY_NAMES[toolName] || engine.engine_name || toolName
 
+    // Optimistically mark this engine as running in messages so the UI updates immediately in place
+    setMessages(prevMessages => prevMessages.map(msg => {
+      if (!msg.tools || msg.tools.length === 0) return msg
+      const tools = msg.tools.map(t => {
+        if ((t.engine_thread_id || t.engine_id) === engineThreadId) {
+          return { ...t, status: 'running' }
+        }
+        return t
+      })
+      return { ...msg, tools }
+    }))
+
     try {
-      const res = await fetch(`${API_BASE}/engine/${engine.engine_thread_id}/resume`, { method: 'POST' })
+      const res = await fetch(`${API_BASE}/engine/${engineThreadId}/resume`, { method: 'POST' })
       const data = await res.json()
 
+      if (!res.ok) {
+        setEngineConflictAlert(data?.detail || "Already one engine is running in this chat. Pause it first before resuming another engine.")
+        // Revert optimistic running update
+        setMessages(prevMessages => prevMessages.map(msg => {
+          if (!msg.tools || msg.tools.length === 0) return msg
+          const tools = msg.tools.map(t => {
+            if ((t.engine_thread_id || t.engine_id) === engineThreadId) {
+              return { ...t, status: 'paused' }
+            }
+            return t
+          })
+          return { ...msg, tools }
+        }))
+        return
+      }
+
       if (data.status === 'resumed') {
+        setEnginesList(prev => prev.map(e => {
+          const eid = e.engine_thread_id || e.engine_id
+          if (eid === engineThreadId) return { ...e, status: 'running' }
+          if (e.status === 'running') return { ...e, status: 'paused' }
+          return e
+        }))
         connectToEngineStream(
-          engine.engine_thread_id,
+          engineThreadId,
           displayName,
           toolName,
           engine.progress || engine.nodes || {}
@@ -451,11 +733,18 @@ export default function App() {
       }
     } catch (err) {
       console.error("Failed to resume engine", err)
+      // Revert if resume failed
+      setMessages(prevMessages => prevMessages.map(msg => {
+        if (!msg.tools || msg.tools.length === 0) return msg
+        const tools = msg.tools.map(t => {
+          if ((t.engine_thread_id || t.engine_id) === engineThreadId) {
+            return { ...t, status: 'paused' }
+          }
+          return t
+        })
+        return { ...msg, tools }
+      }))
     }
-  }
-
-  const dismissResumeDialog = () => {
-    setResumeDialog(null)
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -465,8 +754,9 @@ export default function App() {
   const sendMessage = async () => {
     if (!input.trim()) return
 
-    // Don't allow sending if an engine is running
-    if (activeEngine && activeEngine.status === 'running') {
+    const running = getRunningEngine()
+    if (running) {
+      setEngineConflictAlert("Already one engine is running in this chat. Pause it first to run a second engine.")
       return
     }
 
@@ -488,16 +778,33 @@ export default function App() {
       }
     }
     
+    isNearBottomRef.current = true
     setMessages(prev => [...prev, { role: 'user', content: userMsg }])
     setMessages(prev => [...prev, { role: 'assistant', content: '', tools: [] }])
     setIsStreaming(true)
+    setTimeout(() => scrollToBottom(true), 50)
+
+    if (streamAbortControllerRef.current) {
+      streamAbortControllerRef.current.abort()
+    }
+    const controller = new AbortController()
+    streamAbortControllerRef.current = controller
 
     try {
       const response = await fetch(`${API_BASE}/chats/${currentThreadId}/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg })
+        body: JSON.stringify({ message: userMsg }),
+        signal: controller.signal
       })
+
+      if (!response.ok) {
+        let errData = null
+        try { errData = await response.json() } catch {}
+        setEngineConflictAlert(errData?.detail || "Already one engine is running in this chat. Pause it first to run a second engine.")
+        setMessages(prev => prev.slice(0, prev.length - 2))
+        return
+      }
 
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
@@ -527,9 +834,23 @@ export default function App() {
         }
       }
     } catch (err) {
+      if (err.name === 'AbortError') return
       console.error("Stream error", err)
+      setMessages(prev => {
+        if (prev.length === 0) return prev
+        const copy = [...prev]
+        const last = { ...copy[copy.length - 1] }
+        if (last.role === 'assistant' && !last.content) {
+          last.content = `⚠️ **Connection Error:** Could not reach the API server (${err.message || 'Network error'}). Please verify the server is running.`
+          copy[copy.length - 1] = last
+        }
+        return copy
+      })
     } finally {
       setIsStreaming(false)
+      if (streamAbortControllerRef.current === controller) {
+        streamAbortControllerRef.current = null
+      }
     }
   }
 
@@ -547,11 +868,86 @@ export default function App() {
     }
 
     if (event.type === 'engine_started') {
-      // Engine just started in the background — connect to its SSE stream
+      const eid = event.engine_thread_id
+
+      // If there was an existing active engine, mark it as paused in messages
+      if (activeEngine && activeEngine.engine_thread_id !== eid) {
+        const prevEngine = activeEngine
+        const prevStatus = (prevEngine.status === 'done' || prevEngine.status === 'error') ? prevEngine.status : 'paused'
+        setMessages(prevMessages => prevMessages.map(msg => {
+          if (!msg.tools || msg.tools.length === 0) return msg
+          const tools = msg.tools.map(t => {
+            if ((t.engine_thread_id || t.engine_id) === prevEngine.engine_thread_id) {
+              return { ...t, status: prevStatus, nodes: prevEngine.nodes || t.nodes || {} }
+            }
+            return t
+          })
+          return { ...msg, tools }
+        }))
+      }
+
+      // Initialize node states for this tool
+      const toolNodes = TOOL_NODE_MAP[event.tool] || []
+      const initialNodeStates = {}
+      toolNodes.forEach(n => {
+        initialNodeStates[n.key] = { status: 'pending', detail: '' }
+      })
+
+      // Attach the engine tool block directly into the current assistant message's tools array
+      setMessages(prevMessages => {
+        if (prevMessages.length === 0) return prevMessages
+        const newMsgs = [...prevMessages]
+        let asstIdx = -1
+        for (let i = newMsgs.length - 1; i >= 0; i--) {
+          if (newMsgs[i].role === 'assistant') {
+            asstIdx = i
+            break
+          }
+        }
+        if (asstIdx !== -1) {
+          const asstMsg = { ...newMsgs[asstIdx] }
+          const tools = asstMsg.tools ? [...asstMsg.tools] : []
+          if (!tools.some(t => (t.engine_thread_id || t.engine_id) === eid)) {
+            tools.push({
+              name: event.tool,
+              tool_name: event.tool,
+              engine_id: eid,
+              engine_thread_id: eid,
+              status: 'running',
+              nodes: initialNodeStates,
+              input_data: pendingApproval?.query ? { query: pendingApproval.query } : {},
+            })
+            asstMsg.tools = tools
+            newMsgs[asstIdx] = asstMsg
+          }
+        }
+        return newMsgs
+      })
+
+      // Engine just started in the background — update engines list and connect to its SSE stream
+      setEnginesList(prev => {
+        const exists = prev.some(e => (e.engine_thread_id || e.engine_id) === eid)
+        if (exists) {
+          return prev.map(e => ((e.engine_thread_id || e.engine_id) === eid ? { ...e, status: 'running' } : (e.status === 'running' ? { ...e, status: 'paused' } : e)))
+        }
+        return [
+          ...prev.map(e => e.status === 'running' ? { ...e, status: 'paused' } : e),
+          {
+            engine_thread_id: eid,
+            tool_name: event.tool,
+            engine_name: event.engine_name,
+            status: 'running',
+            input_data: pendingApproval?.query ? { query: pendingApproval.query } : {},
+            created_at: new Date().toISOString(),
+          }
+        ]
+      })
+
       connectToEngineStream(
-        event.engine_thread_id,
+        eid,
         event.engine_name,
         event.tool,
+        initialNodeStates
       )
       return
     }
@@ -604,6 +1000,9 @@ export default function App() {
       else if (event.type === 'stopped') {
         lastMsg.content = (lastMsg.content || '') + '\n\n*Agent stopped by user.*'
       }
+      else if (event.type === 'error') {
+        lastMsg.content = (lastMsg.content || '') + `\n\n⚠️ **Error:** ${event.message || event.error || 'An unexpected error occurred.'}`
+      }
       
       return newMessages
     })
@@ -613,7 +1012,8 @@ export default function App() {
   // Render
   // ─────────────────────────────────────────────────────────────────────────
 
-  const isEngineRunning = activeEngine && (activeEngine.status === 'running' || activeEngine.status === 'pausing')
+  const runningEngine = getRunningEngine()
+  const isEngineRunning = !!runningEngine
 
   return (
     <div className="app-container">
@@ -629,6 +1029,10 @@ export default function App() {
         <button className="new-chat-btn" onClick={handleNewChat}>
           <Plus size={16} /> New Investigation
         </button>
+
+        <Link to="/search" className="search-nav-btn">
+          <Search size={16} /> Search Engine
+        </Link>
 
         <span className="history-label">History</span>
         <div className="chat-history-list">
@@ -656,6 +1060,31 @@ export default function App() {
 
       {/* Main Chat Area */}
       <main className="main-content">
+        {activeThreadId && (
+          <div className="main-content-header">
+            <div className="main-header-info">
+              <span className="main-header-title">{activeThreadId}</span>
+              {activeEngine && (activeEngine.status === 'running' || activeEngine.status === 'pausing') && (
+                <span className="main-header-engine-running">
+                  <Activity size={12} className="spin" />
+                  {ENGINE_DISPLAY_NAMES[activeEngine.tool] || activeEngine.tool} running
+                </span>
+              )}
+            </div>
+            <button 
+              className={`engines-toggle-btn ${isRightPanelOpen ? 'active' : ''}`}
+              onClick={() => setIsRightPanelOpen(!isRightPanelOpen)}
+              title={isRightPanelOpen ? "Hide Engines Panel" : "Show Engines Panel"}
+            >
+              <Activity size={14} />
+              <span>Engines</span>
+              {enginesList.length > 0 && (
+                <span className="engines-toggle-count">{enginesList.length}</span>
+              )}
+            </button>
+          </div>
+        )}
+
         {!activeThreadId ? (
           <div className="welcome-screen">
             <ShieldAlert size={48} className="welcome-icon" />
@@ -665,15 +1094,7 @@ export default function App() {
             </p>
           </div>
         ) : (
-          <div className="chat-area">
-            {/* Resume Dialog */}
-            {resumeDialog && (
-              <ResumeDialog 
-                engines={resumeDialog.engines} 
-                onResume={handleResumeEngine}
-                onDismiss={dismissResumeDialog}
-              />
-            )}
+          <div className="chat-area" ref={chatAreaRef} onScroll={handleChatScroll}>
 
             {messages.map((msg, idx) => (
               <div key={idx} className={`message-wrapper ${msg.role}`}>
@@ -682,14 +1103,41 @@ export default function App() {
                     {msg.role === 'user' ? 'U' : <ShieldAlert size={18} color="white" />}
                   </div>
                   <div className="message-body">
-                    {/* Render tool executions before the text response */}
-                    {msg.role === 'assistant' && msg.tools && msg.tools.map((tool, tIdx) => (
-                      <ToolExecutionBlock key={tIdx} tool={tool} />
-                    ))}
+                    {/* Render tool executions directly in place within the assistant message */}
+                    {msg.role === 'assistant' && msg.tools && msg.tools.map((tool, tIdx) => {
+                      const isThisActive = activeEngine && (tool.engine_thread_id || tool.engine_id) === activeEngine.engine_thread_id
+                      const liveTool = isThisActive ? {
+                        ...tool,
+                        status: activeEngine.status,
+                        nodes: activeEngine.nodes || tool.nodes,
+                        error: activeEngine.error || tool.error,
+                      } : tool
+
+                      return (
+                        <ToolExecutionBlock 
+                          key={tool.engine_thread_id || tool.engine_id || tIdx} 
+                          tool={liveTool} 
+                          onStop={handleStopEngine}
+                          onResume={handleResumeEngine} 
+                        />
+                      )
+                    })}
                     
-                    {/* Render markdown text with GFM plugin for tables */}
+                    {/* Render markdown text with GFM plugin for tables and client-side links */}
                     {msg.content && (
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                      <ReactMarkdown 
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          a: ({ href, children, ...props }) => {
+                            if (href && (href.startsWith('/') || href.startsWith('#'))) {
+                              return <Link to={href} {...props}>{children}</Link>
+                            }
+                            return <a href={href} target="_blank" rel="noopener noreferrer" {...props}>{children}</a>
+                          }
+                        }}
+                      >
+                        {msg.content}
+                      </ReactMarkdown>
                     )}
                     
                     {/* Blink cursor if streaming */}
@@ -710,8 +1158,8 @@ export default function App() {
               />
             )}
 
-            {/* Live Engine Progress Panel */}
-            {activeEngine && (
+            {/* Fallback Engine Progress Panel only if activeEngine is somehow not inside any message */}
+            {activeEngine && !messages.some(m => m.tools?.some(t => (t.engine_thread_id || t.engine_id) === activeEngine.engine_thread_id)) && (
               <EngineProgressPanel 
                 engine={activeEngine} 
                 onStop={handleStopEngine}
@@ -729,11 +1177,20 @@ export default function App() {
             <input 
               type="text" 
               className="chat-input" 
-              placeholder={isEngineRunning ? "Engine is running... wait for it to finish" : "Ask CTI Agent to scan an IP or CVE..."}
+              placeholder={isEngineRunning ? "An engine is running (pause it to ask a new query)..." : "Ask CTI Agent to scan an IP or CVE..."}
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
-              disabled={isStreaming || isEngineRunning || !!pendingApproval}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  if (isEngineRunning) {
+                    setEngineConflictAlert("Already one engine is running in this chat. Pause it first to run a second engine.")
+                  } else {
+                    sendMessage()
+                  }
+                }
+              }}
+              disabled={isStreaming || !!pendingApproval}
             />
             {isStreaming ? (
               <button 
@@ -746,8 +1203,14 @@ export default function App() {
             ) : (
               <button 
                 className="send-btn" 
-                onClick={sendMessage}
-                disabled={!input.trim() || isEngineRunning || !!pendingApproval}
+                onClick={() => {
+                  if (isEngineRunning) {
+                    setEngineConflictAlert("Already one engine is running in this chat. Pause it first to run a second engine.")
+                  } else {
+                    sendMessage()
+                  }
+                }}
+                disabled={!input.trim() || isStreaming || !!pendingApproval}
               >
                 <Send size={16} />
               </button>
@@ -755,6 +1218,52 @@ export default function App() {
           </div>
         </div>
       </main>
+
+      {/* Right Engines Sidebar */}
+      {activeThreadId && isRightPanelOpen && (
+        <EnginesSidebar 
+          engines={enginesList}
+          activeEngine={activeEngine}
+          onStop={handleStopEngine}
+          onResume={handleResumeEngine}
+          onClose={() => setIsRightPanelOpen(false)}
+        />
+      )}
+
+      {/* Engine Conflict Alert Modal */}
+      {engineConflictAlert && (
+        <div className="engine-conflict-overlay" onClick={() => setEngineConflictAlert(null)}>
+          <div className="engine-conflict-modal" onClick={e => e.stopPropagation()}>
+            <div className="engine-conflict-header">
+              <div className="engine-conflict-icon-wrap">
+                <AlertTriangle size={24} color="#f59e0b" />
+              </div>
+              <div className="engine-conflict-title-group">
+                <h3>Engine Conflict</h3>
+                <span className="engine-conflict-badge">Action Blocked</span>
+              </div>
+              <button 
+                className="engine-conflict-close" 
+                onClick={() => setEngineConflictAlert(null)}
+                title="Close"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="engine-conflict-body">
+              <p>{engineConflictAlert}</p>
+            </div>
+            <div className="engine-conflict-footer">
+              <button 
+                className="engine-conflict-btn"
+                onClick={() => setEngineConflictAlert(null)}
+              >
+                OK, Understood
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -802,9 +1311,38 @@ function ToolApprovalCard({ approval, onAccept, onDecline }) {
 function EngineProgressPanel({ engine, onStop, onResume }) {
   const predefinedNodes = TOOL_NODE_MAP[engine.tool] || []
   const allNodeKeys = new Set(predefinedNodes.map(n => n.key))
-  const dynamicNodes = Object.keys(engine.nodes || {})
-    .filter(key => !allNodeKeys.has(key))
-    .map(key => ({ key, label: key.startsWith('nmap_') ? key.replace('nmap_', 'Nmap: ').replace(/_/g, '.') : key }))
+  const allDynamicKeys = Object.keys(engine.nodes || {}).filter(key => !allNodeKeys.has(key) && key !== 'processing')
+  const hasWorkerSlots = allDynamicKeys.some(k => k.startsWith('nmap_worker_'))
+
+  let dynamicNodes = allDynamicKeys
+    .filter(key => {
+      if (hasWorkerSlots && key.startsWith('nmap_') && !key.startsWith('nmap_worker_')) {
+        return false
+      }
+      return true
+    })
+    .map(key => {
+      let label = key
+      if (key.startsWith('nmap_worker_')) {
+        const num = key.replace('nmap_worker_', '')
+        label = `Worker ${num}`
+      } else if (key.startsWith('nmap_')) {
+        label = key.replace('nmap_', 'Nmap: ').replace(/_/g, '.')
+      }
+      return { key, label }
+    })
+    .sort((a, b) => {
+      if (a.key.startsWith('nmap_worker_') && b.key.startsWith('nmap_worker_')) {
+        const numA = parseInt(a.key.replace('nmap_worker_', ''), 10) || 0
+        const numB = parseInt(b.key.replace('nmap_worker_', ''), 10) || 0
+        return numA - numB
+      }
+      return a.key.localeCompare(b.key)
+    })
+
+  if (!hasWorkerSlots && dynamicNodes.length > 5) {
+    dynamicNodes = dynamicNodes.slice(0, 5)
+  }
   
   const nodeList = [...predefinedNodes, ...dynamicNodes]
   const isDone = engine.status === 'done'
@@ -821,7 +1359,7 @@ function EngineProgressPanel({ engine, onStop, onResume }) {
         </div>
         <div className="engine-panel-controls">
           {engine.status === 'running' && (
-            <button className="engine-stop-btn" onClick={onStop} title="Pause Engine">
+            <button className="engine-stop-btn" onClick={() => onStop(engine)} title="Pause Engine">
               <Pause size={14} /> Stop
             </button>
           )}
@@ -878,42 +1416,129 @@ function EngineProgressPanel({ engine, onStop, onResume }) {
 
 
 /**
- * Resume Dialog — shown when user opens a chat with paused engines
+ * Helper to extract human-readable query text from an engine's input data
  */
-function ResumeDialog({ engines, onResume, onDismiss }) {
-  return (
-    <div className="resume-dialog">
-      <div className="resume-dialog-header">
-        <AlertTriangle size={18} />
-        <span>You have incomplete engine runs</span>
-      </div>
-      <div className="resume-dialog-body">
-        {engines.map((engine, idx) => {
-          const displayName = ENGINE_DISPLAY_NAMES[engine.tool_name] || engine.tool_name
-          const queryText = engine.input_data?.query || engine.input_data?.ip_addresses?.join(', ') || engine.input_data?.cve_ids?.join(', ') || 'Unknown'
+function getEngineQueryText(engine) {
+  if (!engine) return ''
+  const inp = engine.input_data || engine.input || {}
+  if (inp.query) return inp.query
+  if (inp.ip_addresses && Array.isArray(inp.ip_addresses)) return inp.ip_addresses.join(', ')
+  if (inp.cve_ids && Array.isArray(inp.cve_ids)) return inp.cve_ids.join(', ')
+  if (typeof inp === 'string') return inp
+  return engine.query || ''
+}
 
-          return (
-            <div key={idx} className="resume-engine-item" onClick={() => onResume(engine)}>
-              <div className="resume-engine-info">
-                <span className="resume-engine-name">{displayName}</span>
-                <span className="resume-engine-query">"{queryText}"</span>
-              </div>
-              <div className="resume-engine-status">
-                <Pause size={12} /> Paused
-              </div>
-              <button className="resume-engine-btn">
-                <Play size={14} /> Resume
-              </button>
-            </div>
-          )
-        })}
-      </div>
-      <div className="resume-dialog-footer">
-        <button className="resume-dismiss-btn" onClick={onDismiss}>
-          Continue without resuming
+
+/**
+ * Engines Sidebar — Right panel displaying all engine runs for the active chat
+ */
+function EnginesSidebar({
+  engines,
+  activeEngine,
+  onStop,
+  onResume,
+  onClose,
+}) {
+  return (
+    <aside className="engines-sidebar">
+      <div className="engines-sidebar-header">
+        <div className="engines-sidebar-title">
+          <TerminalSquare size={16} />
+          <span>Engine Runs</span>
+          {engines.length > 0 && (
+            <span className="engines-badge">{engines.length}</span>
+          )}
+        </div>
+        <button 
+          className="engines-collapse-btn" 
+          onClick={onClose} 
+          title="Collapse Engines Panel"
+        >
+          <ChevronRight size={18} />
         </button>
       </div>
-    </div>
+
+      <div className="engines-sidebar-content">
+        {engines.length === 0 ? (
+          <div className="engines-empty-state">
+            <Activity size={32} className="engines-empty-icon" />
+            <span>No engine runs yet</span>
+            <p>Background scans started in this investigation will appear here.</p>
+          </div>
+        ) : (
+          <div className="engines-tickets-list">
+            {engines.map((engine, idx) => {
+              const engineId = engine.engine_thread_id || engine.engine_id
+              const isActive = activeEngine && (activeEngine.engine_thread_id === engineId)
+              const currentStatus = isActive ? activeEngine.status : (engine.status || 'done')
+              const toolName = engine.tool_name || engine.tool || engine.name
+              const displayName = ENGINE_DISPLAY_NAMES[toolName] || engine.engine_name || toolName
+              const queryText = getEngineQueryText(engine)
+              
+              const isRunning = currentStatus === 'running'
+              const isPausing = currentStatus === 'pausing'
+              const isPaused = currentStatus === 'paused'
+              const isDone = currentStatus === 'done'
+              const isError = currentStatus === 'error'
+
+              return (
+                <div key={engineId || idx} className={`engine-ticket ${currentStatus}`}>
+                  <div className="engine-ticket-top">
+                    <div className="engine-ticket-name">
+                      <TerminalSquare size={14} />
+                      <span>{displayName}</span>
+                    </div>
+                    <div className={`engine-ticket-badge ${currentStatus}`}>
+                      {isRunning && <><Activity size={10} className="spin" /> Running</>}
+                      {isPausing && <><Activity size={10} className="spin" /> Stopping...</>}
+                      {isPaused && <><Pause size={10} /> Paused</>}
+                      {isDone && <><CheckCircle2 size={10} /> Done</>}
+                      {isError && <><AlertTriangle size={10} /> Error</>}
+                    </div>
+                  </div>
+
+                  {queryText && (
+                    <div className="engine-ticket-query" title={queryText}>
+                      "{queryText}"
+                    </div>
+                  )}
+
+                  <div className="engine-ticket-actions">
+                    {isRunning && (
+                      <button 
+                        className="ticket-btn stop" 
+                        onClick={() => onStop(engine)} 
+                        title="Pause Engine"
+                      >
+                        <Pause size={12} /> Stop
+                      </button>
+                    )}
+                    {isPausing && (
+                      <button 
+                        className="ticket-btn stop disabled" 
+                        disabled 
+                        title="Stopping Engine..."
+                      >
+                        <Activity size={12} className="spin" /> Stopping...
+                      </button>
+                    )}
+                    {isPaused && (
+                      <button 
+                        className="ticket-btn resume" 
+                        onClick={() => onResume(engine)} 
+                        title="Resume Engine"
+                      >
+                        <Play size={12} /> Resume
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+    </aside>
   )
 }
 
@@ -922,41 +1547,111 @@ function ResumeDialog({ engines, onResume, onDismiss }) {
  * Renders a stylized block showing the engine pipeline with real-time node progress.
  * (Used for historical tool calls loaded from DB)
  */
-function ToolExecutionBlock({ tool }) {
-  const predefinedNodes = TOOL_NODE_MAP[tool.name] || [
+function ToolExecutionBlock({ tool, onStop, onResume }) {
+  const toolName = tool.name || tool.tool_name
+  const predefinedNodes = TOOL_NODE_MAP[toolName] || [
     { key: 'processing', label: 'Processing' },
   ]
   const allNodeKeys = new Set(predefinedNodes.map(n => n.key))
-  const dynamicNodes = Object.keys(tool.nodes || {})
-    .filter(key => !allNodeKeys.has(key) && key !== 'processing')
-    .map(key => ({ key, label: key.startsWith('nmap_') ? key.replace('nmap_', 'Nmap: ').replace(/_/g, '.') : key }))
+  const allDynamicKeys = Object.keys(tool.nodes || {}).filter(key => !allNodeKeys.has(key) && key !== 'processing')
+  const hasWorkerSlots = allDynamicKeys.some(k => k.startsWith('nmap_worker_'))
+
+  let dynamicNodes = allDynamicKeys
+    .filter(key => {
+      if (hasWorkerSlots && key.startsWith('nmap_') && !key.startsWith('nmap_worker_')) {
+        return false
+      }
+      return true
+    })
+    .map(key => {
+      let label = key
+      if (key.startsWith('nmap_worker_')) {
+        const num = key.replace('nmap_worker_', '')
+        label = `Worker ${num}`
+      } else if (key.startsWith('nmap_')) {
+        label = key.replace('nmap_', 'Nmap: ').replace(/_/g, '.')
+      }
+      return { key, label }
+    })
+    .sort((a, b) => {
+      if (a.key.startsWith('nmap_worker_') && b.key.startsWith('nmap_worker_')) {
+        const numA = parseInt(a.key.replace('nmap_worker_', ''), 10) || 0
+        const numB = parseInt(b.key.replace('nmap_worker_', ''), 10) || 0
+        return numA - numB
+      }
+      return a.key.localeCompare(b.key)
+    })
+
+  if (!hasWorkerSlots && dynamicNodes.length > 5) {
+    dynamicNodes = dynamicNodes.slice(0, 5)
+  }
   
   const nodeList = [...predefinedNodes, ...dynamicNodes]
 
-  const isDone = tool.status === 'done'
+  const isRunning = tool.status === 'running'
+  const isPausing = tool.status === 'pausing'
   const isPaused = tool.status === 'paused'
+  const isDone = tool.status === 'done'
+  const isError = tool.status === 'error'
 
   return (
     <div className={`tool-block ${tool.status}`}>
       <div className="tool-header">
         <div className="tool-title">
           <TerminalSquare size={16} />
-          {ENGINE_DISPLAY_NAMES[tool.name] || tool.name}
+          {ENGINE_DISPLAY_NAMES[toolName] || toolName}
         </div>
-        <div className={`tool-status-badge ${tool.status}`}>
-          {tool.status === 'running' ? (
-            <span style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
-              <Activity size={12} /> Running Engine
-            </span>
-          ) : tool.status === 'paused' ? (
-            <span style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
-              <Pause size={12} /> Paused
-            </span>
-          ) : (
-            <span style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
-              <CheckCircle2 size={12} /> Completed
-            </span>
+        <div className="tool-controls">
+          {isRunning && onStop && (
+            <button 
+              className="tool-stop-btn" 
+              onClick={() => onStop(tool)} 
+              title="Pause Engine"
+            >
+              <Pause size={13} /> Stop
+            </button>
           )}
+          {isPausing && (
+            <button 
+              className="tool-stop-btn disabled" 
+              disabled 
+              title="Stopping Engine..."
+            >
+              <Activity size={13} className="spin" /> Stopping...
+            </button>
+          )}
+          {isPaused && onResume && (
+            <button 
+              className="tool-resume-btn" 
+              onClick={() => onResume(tool)} 
+              title="Resume Engine"
+            >
+              <Play size={13} /> Resume
+            </button>
+          )}
+          <div className={`tool-status-badge ${tool.status}`}>
+            {isRunning ? (
+              <span style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
+                <Activity size={12} className="spin" /> Running Engine
+              </span>
+            ) : isPausing ? (
+              <span style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
+                <Activity size={12} className="spin" /> Stopping...
+              </span>
+            ) : isPaused ? (
+              <span style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
+                <Pause size={12} /> Paused
+              </span>
+            ) : isError ? (
+              <span style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
+                <AlertTriangle size={12} /> Error
+              </span>
+            ) : (
+              <span style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
+                <CheckCircle2 size={12} /> Completed
+              </span>
+            )}
+          </div>
         </div>
       </div>
       
@@ -966,6 +1661,8 @@ function ToolExecutionBlock({ tool }) {
           
           let displayStatus = nodeState.status
           if (isDone) displayStatus = 'done'
+          if (isPaused && displayStatus === 'running') displayStatus = 'paused'
+          if (isPausing && displayStatus === 'running') displayStatus = 'running'
 
           return (
             <div key={index} className={`node-item ${displayStatus}`}>
