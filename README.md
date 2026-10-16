@@ -54,7 +54,7 @@
 
 ## Key Features
 
-- **Autonomous AI Security Analyst**: LangGraph ReAct agent powered by Groq (`openai/gpt-oss-120b`) that reasons over threat queries, queries the local PostgreSQL database, and coordinates background scanning engines.
+- **Autonomous AI Security Analyst**: LangGraph ReAct agent powered by Groq (`openai/gpt-oss-120b` for reasoning, `openai/gpt-oss-20b` for query generation) that reasons over threat queries, queries the local PostgreSQL database, and coordinates background scanning engines.
 - **Human-in-the-Loop (HITL) Safeguards**: LangGraph interrupt mechanisms pause execution before launching active scans, requesting user authorization via interactive approval cards.
 - **Three Specialized Recon Engines**:
   - **Natural Language Query Engine**: Converts conversational queries (e.g. *"Find vulnerable Apache servers in Germany"*) into Shodan search dorks, discovers IPs, runs deep scans, and maps CVEs.
@@ -117,7 +117,8 @@
                                                     ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                       POSTGRESQL DATABASE (cti_db)                                     │
-│  • CTI Intelligence: hosts, scans, ports, vulnerabilities, technologies, cve_details, affected_products│
+│  • CTI Intelligence: hosts, scans, ports, vulnerabilities, technologies, cve_details,                 │
+│    cve_affected_products (CPEs), cve_analysis, cve_mitre_mappings                                     │
 │  • AI & ATT&CK: cve_analysis (walkthroughs, mitigations, detection), cve_mitre_mappings (tactics, tech)│
 │  • Checkpoints: nmap_scan_checkpoints, checkpoints, checkpoint_blobs, checkpoint_writes                │
 │  • Chat & Session State: chat_messages, tool_calls                                                     │
@@ -301,22 +302,22 @@ The FastAPI backend runs at `http://localhost:8000` ([`Backend/api_server.py`](f
 
 Data is stored in PostgreSQL (`cti_db`). Tables are initialized automatically on startup by [`db_manager.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/db_manager.py) and [`chat_persistence.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/chat_persistence.py):
 
-### CTI Reconnaissance Tables
-1. **`hosts`**: Central inventory of scanned IPs (`ip`, `country`, `city`, `organization`, `isp`, `asn`, `os`, `tags`, `first_seen`, `last_updated`).
-2. **`scans`**: Historical scan snapshots per host (`host_id`, `source`, `source_last_seen`, `scraped_at`, `raw_data`, `metadata`).
-3. **`ports`**: Discovered ports, services, and banners (`scan_id`, `port_number`, `protocol`, `state`, `service`, `version`, `banner`, `http_title`, `extra`).
-4. **`vulnerabilities`**: CVEs discovered on specific ports (`port_id`, `cve_id`, `cvss`, `cvss_vector`, `summary`).
-5. **`technologies`**: Detected web technologies and libraries (`scan_id`, `category`, `name`, `version`).
-6. **`cve_details`**: Normalized NIST NVD intelligence (`cve_id`, `description`, `cwe_id`, `base_score`, `severity`, `published_date`, `reference_urls`, `nvd_raw`).
-7. **`cve_affected_products`**: CPE hardware/software configurations (`cve_detail_id`, `vendor`, `product`, `version`, `affected_platform`).
-8. **`cve_analysis`**: ChatGPT threat analyses (`cve_detail_id`, `title`, `exploitation_info`, `mitigations`, `detection_recommendations`, `vulnerability_walkthrough`).
-9. **`cve_mitre_mappings`**: MITRE ATT&CK framework mapping (`cve_analysis_id`, `tactic_id`, `tactic_name`, `technique_id`, `technique_name`, `justification`).
-10. **`nmap_scan_checkpoints`**: Per-phase state checkpoints (`ip`, `engine_thread_id`, `last_phase`, `state_data`).
+### CTI Reconnaissance Tables (10 tables)
+1. **`hosts`**: Central inventory of scanned IPs (`ip` INET UNIQUE, `country`, `city`, `organization`, `isp`, `asn`, `os`, `tags` JSONB, `first_seen`, `last_updated`). Indexes on `ip`, `country`, `asn`, `organization`, `tags` (GIN).
+2. **`scans`**: Historical scan snapshots per host (`host_id` FK, `source`, `source_last_seen` DATE, `scraped_at`, `raw_data` JSONB, `metadata` JSONB). Indexes on `host_id`, `source`, `scraped_at` DESC, deduplication unique on `(host_id, source, source_last_seen)`.
+3. **`ports`**: Discovered ports, services, and banners (`scan_id` FK, `port_number`, `protocol` DEFAULT 'tcp', `state` DEFAULT 'open', `service`, `version`, `http_title`, `banner`, `timestamp` DATE, `extra` JSONB). Indexes on `scan_id`, `port_number`, `service`.
+4. **`vulnerabilities`**: CVEs discovered on specific ports (`port_id` FK, `cve_id`, `cvss` FLOAT, `cvss_vector`, `summary`). Indexes on `port_id`, `cve_id`, `cvss` DESC.
+5. **`technologies`**: Detected web technologies and libraries (`scan_id` FK, `category`, `name`, `version`). Indexes on `scan_id`, `name`.
+6. **`cve_details`**: Normalized NIST NVD intelligence (`cve_id` UNIQUE, `description`, `cwe_id`, `cwe_name`, `cvss_version`, `cvss_vector`, `attack_vector`, `attack_complexity`, `privileges_required`, `user_interaction`, `scope`, `confidentiality_impact`, `integrity_impact`, `availability_impact`, `base_score` FLOAT, `severity`, `exploit_available` BOOLEAN, `epss_score` FLOAT, `epss_percentile` FLOAT, `kev_listed` BOOLEAN, `published_date`, `last_modified_date`, `reference_urls` JSONB, `nvd_raw` JSONB). Indexes on `cve_id`, `severity`, `base_score` DESC.
+7. **`cve_affected_products`**: CPE hardware/software configurations from NVD (`cve_detail_id` FK, `vendor`, `product`, `version`, `affected_platform`). Indexes on `cve_detail_id`, `vendor`, `product`.
+8. **`cve_analysis`**: ChatGPT threat analyses (`cve_detail_id` FK UNIQUE, `title`, `exploitation_info` JSONB, `mitigations` JSONB, `detection_recommendations` JSONB, `vulnerability_walkthrough` JSONB, `chatgpt_references` JSONB, `chatgpt_raw` JSONB, `analyzed_at`). Index on `cve_detail_id`.
+9. **`cve_mitre_mappings`**: MITRE ATT&CK framework mapping from ChatGPT (`cve_analysis_id` FK, `tactic_id`, `tactic_name`, `technique_id`, `technique_name`, `justification`). Indexes on `cve_analysis_id`, `technique_id`.
+10. **`nmap_scan_checkpoints`**: Per-phase state checkpoints for 9-phase Nmap scanner (`ip` INET, `engine_thread_id`, `last_phase` INT, `state_data` JSONB, `updated_at`, UNIQUE on `(ip, engine_thread_id)`). Index on `ip`.
 
-### Chat & Agent Persistence Tables
-11. **`chat_messages`**: Chat conversation history and streaming states (`thread_id`, `role`, `content`, `message_index`, `is_complete`).
-12. **`tool_calls`**: In-progress and completed engine executions (`thread_id`, `tool_call_id`, `tool_name`, `engine_thread_id`, `status`, `progress`, `result_summary`).
-13. **`checkpoints` / `checkpoint_blobs` / `checkpoint_writes`**: LangGraph internal state tables managed by `PostgresSaver`.
+### Chat & Agent Persistence Tables (3 tables)
+11. **`chat_messages`**: Chat conversation history with token-level streaming persistence (`thread_id`, `role` user/assistant, `content`, `message_index`, `is_complete` BOOLEAN, `created_at`, `updated_at`). Index on `(thread_id, message_index)`.
+12. **`tool_calls`**: Engine invocation tracking with live progress JSONB (`thread_id`, `tool_call_id` UNIQUE, `tool_name`, `engine_thread_id`, `input_data` JSONB, `status` running/paused/done/error, `progress` JSONB, `result_summary`, `message_index`, `created_at`, `updated_at`). Indexes on `(thread_id, created_at DESC)`, `tool_call_id`.
+13. **LangGraph Checkpoint Tables** (`checkpoints`, `checkpoint_blobs`, `checkpoint_writes`): Internal state tables managed by `PostgresSaver` for LangGraph ReAct agent and engine state persistence.
 
 ---
 
@@ -526,4 +527,3 @@ CTI_V2/
 
 - **Author**: **jassi789012** ([jassi789012singh@gmail.com](mailto:jassi789012singh@gmail.com))
 - **Repository**: [https://github.com/jassi789012/CTI_v2](https://github.com/jassi789012/CTI_v2)
-- **License**: Educational & Authorized Security Research License.
