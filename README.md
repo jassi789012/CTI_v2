@@ -54,17 +54,20 @@
 
 ## Key Features
 
-- **Autonomous AI Security Analyst**: LangGraph ReAct agent powered by Groq (`openai/gpt-oss-120b` for reasoning, `openai/gpt-oss-20b` for query generation) that reasons over threat queries, queries the local PostgreSQL database, and coordinates background scanning engines.
+- **Autonomous AI Security Analyst**: LangGraph ReAct agent powered by Groq (`openai/gpt-oss-120b` for reasoning, `openai/gpt-oss-20b` for query generation) that reasons over threat queries, queries the local PostgreSQL CTI database, and coordinates background scanning engines.
+- **Prebuilt SQL Database Toolkit**: Integrated LangChain `SQLDatabaseToolkit` with read-only enforcement (`SET default_transaction_read_only = ON`) for safe, autonomous database exploration — the agent can list tables, read schemas, and run SQL queries without risk of data mutation.
+- **Token-Optimized Query Pipeline**: Custom `query_database` tool sends only a brief summary (row count + column names) to the LLM while streaming full structured results directly to the frontend via `db_results` SSE events — avoiding token limit exhaustion on rate-limited LLM APIs.
 - **Human-in-the-Loop (HITL) Safeguards**: LangGraph interrupt mechanisms pause execution before launching active scans, requesting user authorization via interactive approval cards.
 - **Three Specialized Recon Engines**:
   - **Natural Language Query Engine**: Converts conversational queries (e.g. *"Find vulnerable Apache servers in Germany"*) into Shodan search dorks, discovers IPs, runs deep scans, and maps CVEs.
   - **Direct IP Scanner Engine**: Performs 9-phase deep scans and Shodan reconnaissance directly on target IP lists.
   - **CVE Research Engine**: Directly fetches NVD metrics and runs automated ChatGPT MITRE ATT&CK mapping and exploit walkthroughs on specific CVE IDs.
+- **14-Day Scan Staleness Check**: Scanners automatically skip IPs that were scanned within the last 14 days to avoid redundant work. The agent informs users when data is fresh.
 - **9-Phase Full-Spectrum Nmap Scanner**: Sequential multi-phase scanner with automated TCP, UDP, Service detection, OS fingerprinting, 64 NSE enumeration scripts, SSL ciphers, WHOIS/DNS/GeoIP, ACK firewall detection, IP protocols, and SCTP scans.
 - **Per-Phase Checkpointing & Resumption**: Every Nmap phase and LangGraph engine step writes state to PostgreSQL, allowing immediate pause and resume without losing prior progress.
 - **Zero-Cost LLM Enrichment**: Headless Playwright ChatGPT browser automation with persistent session profiles, multi-account rotation, anti-bot mitigation, and robust JSON schema extraction.
 - **Live SSE Streaming**: FastAPI server streams agent reasoning tokens and engine step-by-step execution metrics over Server-Sent Events (SSE).
-- **Interactive Cyberpunk Frontend**: Built with React 19, Vite, and Lucide icons, featuring real-time node progress trackers, pause/resume/stop controls, and GFM markdown rendering.
+- **Modern Chatbot UI with Tool Indicators**: Built with React 19, Vite, and Lucide icons — featuring collapsible tool execution indicators (like modern AI chatbots), formatted query result tables, real-time node progress trackers, pause/resume/stop controls, and GFM markdown rendering.
 
 ---
 
@@ -75,8 +78,8 @@
 │                                          REACT 19 FRONTEND (Vite)                                      │
 │  ┌─────────────────────────┐  ┌──────────────────────────┐  ┌───────────────────┐  ┌────────────────┐  │
 │  │ AI Chatbot (/ & /chat)  │  │ Threat Search (/search)  │  │ Host Intel (/ip)  │  │ Vuln Intel     │  │
-│  │ Live SSE Engine Tracker │  │ 43-Filter Shodan Dorks   │  │ Nmap+Shodan Tabs  │  │ Local Assets & │  │
-│  │ HITL Approval Cards     │  │ Dynamic Aggregations     │  │ ACK Firewall/SSL  │  │ ATT&CK Mapping │  │
+│  │ Tool Use Indicators     │  │ 43-Filter Shodan Dorks   │  │ Nmap+Shodan Tabs  │  │ Local Assets & │  │
+│  │ HITL Cards / DB Tables  │  │ Dynamic Aggregations     │  │ ACK Firewall/SSL  │  │ ATT&CK Mapping │  │
 │  └─────────────────────────┘  └──────────────────────────┘  └───────────────────┘  └────────────────┘  │
 └───────────────────────────────────────────────────┬────────────────────────────────────────────────────┘
                                                     │ HTTP REST / SSE Event Streams
@@ -92,8 +95,10 @@
 │          MAIN AGENT (main_agent.py)          │       │         ENGINE MANAGER (engine_manager.py)      │
 │  • LangGraph ReAct Agent Loop                │       │  • Background Thread Coordination & Execution   │
 │  • Groq LLM (openai/gpt-oss-120b)            │       │  • Real-time SSE Event Queues (engine_progress) │
-│  • HITL Tool Interruption & Approval Gate    │       │  • Cooperative Thread Interruption & Pause/Stop │
-└───────────────────────────┬──────────────────┘       └────────────────────────┬────────────────────────┘
+│  • SQLDatabaseToolkit (read-only, schema)     │       │  • Cooperative Thread Interruption & Pause/Stop │
+│  • Token-Optimized query_database Tool        │       └────────────────────────┬────────────────────────┘
+│  • HITL Tool Interruption & Approval Gate    │
+└───────────────────────────┬──────────────────┘
                             │                                                   │
                             ▼                                                   ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -156,10 +161,13 @@ Used for targeted vulnerability research:
 
 The agent is implemented using **LangGraph ReAct** architecture in [`Backend/main_agent.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/main_agent.py):
 
-- **Tool Selection**: When an analyst sends a prompt, the agent decides whether to answer from internal knowledge, query the local PostgreSQL CTI database, or launch an active enumeration engine.
+- **Database-First Routing**: The agent always checks the local PostgreSQL database before launching any scan engine, presenting existing results immediately and only suggesting scans when data is missing or stale.
+- **Prebuilt SQL Toolkit**: Uses LangChain's `SQLDatabaseToolkit` for schema exploration (`sql_db_list_tables`, `sql_db_schema`) plus a custom `query_database` tool for token-optimized SQL execution. The database connection is enforced read-only at the PostgreSQL level.
+- **Token-Optimized Results**: The `query_database` tool returns only a compact summary to the LLM (row count + column names) while embedding full results as base64-encoded JSON in the tool output. `stream_agent` extracts this data and emits a separate `db_results` SSE event directly to the frontend, where it renders as a styled interactive table — keeping the LLM context small and avoiding rate limit errors.
 - **Human-in-the-Loop Interrupts**: Starting a network scan is an active operation. The agent raises an `interrupt(...)` before executing `scan_natural_language_query`, `scan_ip_list`, or `scan_cve_list`.
 - **Approval Cards**: The frontend receives a `tool_approval` SSE event and presents the user with an authorization card displaying the tool name and exact parameters.
 - **Resume & Execution**: Clicking **Accept** issues a `POST /api/chats/{thread_id}/approve`, resuming LangGraph state via `PostgresSaver` checkpointer and launching the engine in a background thread.
+- **14-Day Scan Freshness**: The `get_ip_info` (Shodan) and `nmap_scanner` modules automatically check scan timestamps and skip IPs scanned within the last 14 days. The agent informs users when their target data is fresh.
 
 ---
 
@@ -208,6 +216,8 @@ The frontend is located in [`Frontend/Chatbot/`](file:///c:/Users/jassi/OneDrive
 
 ### 1. AI Threat Analyst Chat (`/` & `/chat`)
 - **Real-Time Token Streaming**: Agent thoughts and execution steps stream via Server-Sent Events (SSE) with GFM Markdown formatting.
+- **Tool Use Indicators**: Modern chatbot-style collapsible tool execution blocks showing which tools the agent is using (e.g., "Listed tables ✓", "Reading table schema ✓", "Queried database ✓") with running spinners and completion checkmarks.
+- **Query Results Table**: Database query results render as a styled, collapsible table card (`QueryResultsTable`) with SQL preview, sticky column headers, alternating row colors, and horizontal scroll — data is streamed directly from the backend, never passing through the LLM.
 - **Human-in-the-Loop Cards**: Interactive authorization cards when the agent proposes active scans (`scan_natural_language_query`, `scan_ip_list`, `scan_cve_list`).
 - **Live Recon Engine Panel**: Visualizes pipeline stages (`Query Gen`, `IP Discovery`, `Parallel Scanning`, `CVE Extraction`, `NVD + AI Enrichment`, `Summary`) with per-phase Nmap status badges and pause/resume/stop buttons.
 - **Chat History Sidebar**: Persistent conversation switcher with thread creation, deletion, and local storage synchronization.

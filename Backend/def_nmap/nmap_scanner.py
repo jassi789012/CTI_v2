@@ -1797,6 +1797,22 @@ def nmap_scan_ips_gen(
 
             print(f"\n[{i}/{total}] [Worker {worker_id}] Scanning: {ip}")
 
+            # ── 2-Week Staleness Check ───────────────────────────────────
+            # If Nmap data for this IP is less than 14 days old, skip it.
+            if db:
+                with db_lock:
+                    try:
+                        if not db.is_scan_stale(ip, source="nmap", max_age_days=14):
+                            print(f"[=] Skipping {ip} — Nmap data is fresh (scanned within 14 days).")
+                            try:
+                                from engine_progress import emit_progress
+                                emit_progress(f"nmap_worker_{worker_id}", "done", f"{ip} — Skipped (fresh data)")
+                            except Exception:
+                                pass
+                            return {"ip": ip, "skipped": True, "reason": "fresh data (scanned within 14 days)"}
+                    except Exception as e:
+                        print(f"    [!] Staleness check error for {ip}: {e}. Proceeding with scan.")
+
             if multiphase:
                 parsed = _scan_ip_multiphase(ip, engine_thread_id=engine_thread_id, worker_id=worker_id)
             else:

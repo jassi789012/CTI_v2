@@ -6,9 +6,14 @@ reasons about the best course of action, and uses enumeration engine
 tools to scan targets and gather cyber threat intelligence.
 
 Tools Available:
-  1. scan_natural_language_query — Runs the full pipeline from a user query
-  2. scan_ip_list               — Scans a list of known IP addresses
-  3. scan_cve_list              — Fetches NVD data + ChatGPT analysis for CVE IDs
+  Database Tools (via LangChain SQLDatabaseToolkit — read-only):
+    - query_database            — Run SQL queries (results go to frontend, summary to LLM)
+    - sql_db_schema             — Get table schemas and sample data
+    - sql_db_list_tables        — List available database tables
+  Engine Tools:
+    - scan_natural_language_query — Runs the full pipeline from a user query
+    - scan_ip_list               — Scans a list of known IP addresses
+    - scan_cve_list              — Fetches NVD data + ChatGPT analysis for CVE IDs
 
 Architecture:
   - LLM:          Groq API  (openai/gpt-oss-120b)
@@ -43,6 +48,12 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.types import interrupt, Command
 from langchain_core.runnables import RunnableConfig
 
+import warnings
+warnings.filterwarnings("ignore", message=".*langchain-community.*being sunset.*")
+from langchain_community.utilities import SQLDatabase
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+from sqlalchemy import create_engine, event
+
 from engine_manager import EngineManager
 
 # Thread-local to pass the chat thread_id down to tools
@@ -68,6 +79,27 @@ PG_CONN_STRING = (
     f"{os.getenv('PG_DATABASE', 'cti_db')}"
 )
 
+# ─── Read-Only Database for Agent Tools ──────────────────────────────────────
+_sql_engine = create_engine(PG_CONN_STRING)
+
+@event.listens_for(_sql_engine, "connect")
+def _set_pg_readonly(dbapi_connection, connection_record):
+    """Enforce read-only mode on every database connection.
+    PostgreSQL will reject INSERT, UPDATE, DELETE, DROP, etc."""
+    cursor = dbapi_connection.cursor()
+    cursor.execute("SET default_transaction_read_only = ON")
+    cursor.close()
+
+_sql_db = SQLDatabase(
+    engine=_sql_engine,
+    include_tables=[
+        "hosts", "scans", "ports", "vulnerabilities", "technologies",
+        "cve_details", "cve_affected_products", "cve_analysis", "cve_mitre_mappings",
+    ],
+    sample_rows_in_table_info=0,   # No sample rows — prevents huge JSONB blobs from bloating context
+    max_string_length=200,         # Truncate long column values in query results
+)
+
 # ─── LLM Config ──────────────────────────────────────────────────────────────
 GROQ_MODEL = "openai/gpt-oss-120b"
 
@@ -78,41 +110,81 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 
 SYSTEM_PROMPT = """You are a Cyber Threat Intelligence (CTI) analyst agent. You help security researchers and analysts discover, scan, and analyze cyber threats.
 
-You have access to three enumeration engine tools. Each engine runs a multi-step LangGraph workflow that scans targets, collects data, and stores everything in a PostgreSQL database.
+You have access to enumeration engine tools and local database tools. All scan data is stored in a PostgreSQL database.
 
 ## Your Tools
 
-### 1. scan_natural_language_query
+### Database Tools (ALWAYS CHECK FIRST)
+
+#### sql_db_list_tables
+List all available tables in the database. Call this first if you're unsure which tables exist.
+
+#### sql_db_schema
+Get the schema (columns, types, and sample rows) for specific tables.
+- Pass table names as a comma-separated string, e.g.: "hosts, scans, ports"
+
+#### query_database
+Execute a SQL query against the CTI database. **Results are displayed directly to the user
+in a formatted table — you only receive a brief summary (row count and column names).**
+- The database connection is **read-only** — INSERT, UPDATE, DELETE, DROP, etc. will be rejected.
+- Use `::inet` cast for IP comparisons: `WHERE ip = '1.2.3.4'::inet`
+- Join hosts → scans → ports → vulnerabilities for full IP data
+- Join cve_details → cve_analysis → cve_mitre_mappings for full CVE data
+- Use LIMIT to keep results manageable
+- **IMPORTANT: NEVER create a markdown table, list, or repeat the raw data in your response.**
+  The user already sees the results in a formatted table rendered by the frontend.
+  Just write a brief natural language summary of what was found (e.g. "Found 5 Apache servers across 3 countries").
+
+### Enumeration Engine Tools
+
+#### scan_natural_language_query
 Use this when the user describes what they want to find in natural language.
-- Example user input: "Find Apache servers in India with known vulnerabilities"
-- What it does: Converts the query into Shodan search dorks → fetches IPs → runs Nmap + Shodan scans on each IP → extracts CVEs → fetches NVD data → enriches with ChatGPT analysis
-- This is the FULL pipeline. Use it when the user doesn't have specific IPs or CVEs yet.
+- Example: "Find Apache servers in India with known vulnerabilities"
+- Full pipeline: query → Shodan dorks → IP discovery → Nmap + Shodan scans → CVE extraction → NVD enrichment → ChatGPT analysis
+- Use ONLY when the user doesn't have specific IPs or CVEs and needs discovery.
 
-### 2. scan_ip_list
+#### scan_ip_list
 Use this when the user provides specific IP addresses to scan.
-- Example user input: "Scan 1.2.3.4 and 5.6.7.8"
-- What it does: Runs Nmap (8-phase full-spectrum scan) + Shodan scraping on each IP → extracts CVEs → fetches NVD data → enriches with ChatGPT analysis
-- Skips query generation and IP discovery since the user already has the IPs.
+- Example: "Scan 1.2.3.4 and 5.6.7.8"
+- Runs Nmap (8-phase) + Shodan scraping → CVE extraction → NVD + ChatGPT enrichment
+- Note: The scanner automatically skips IPs that were scanned within the last 14 days.
 
-### 3. scan_cve_list
+#### scan_cve_list
 Use this when the user provides specific CVE IDs to look up.
-- Example user input: "Give me details about CVE-2024-1234 and CVE-2023-5678"
-- What it does: Fetches full NVD data for each CVE → enriches with ChatGPT MITRE ATT&CK mapping and vulnerability walkthrough
-- Skips all IP-related scanning. Use this for pure CVE research.
+- Example: "Give me details about CVE-2024-1234"
+- Fetches NVD data → ChatGPT MITRE ATT&CK mapping + vulnerability walkthrough
+
+## CRITICAL: Database-First Query Routing
+
+**ALWAYS check the local database first before launching any scan engine.**
+
+When a user asks about an IP, CVE, or any target:
+1. First, use `query_database` to check if data already exists in the local database.
+2. If data is found and relevant, present the results to the user immediately.
+3. Only suggest or launch a scan engine if:
+   - No data exists in the database for the requested target, OR
+   - The user explicitly asks for a fresh/new scan, OR
+   - The existing data is clearly incomplete for what the user needs.
+
+This saves time and avoids redundant scanning. Scans can take 10-60+ minutes.
 
 ## Important Behavior Rules
 
-1. **Choose the right tool.** If the user gives you IPs, use scan_ip_list. If they give you CVEs, use scan_cve_list. If they describe what they want in plain English, use scan_natural_language_query. Never use the wrong tool.
+1. **Database first.** Always query the local database before scanning. If data exists, show it.
 
-2. **Engine IDs.** Each tool returns an Engine ID (thread_id). Always tell the user this ID so they can resume the scan later if needed. Example: "I've started your scan. The Engine ID is ips_a1b2c3d4."
+2. **Choose the right tool.** If the user gives IPs, use scan_ip_list. CVEs → scan_cve_list. Natural language → scan_natural_language_query.
 
-3. **Report results clearly.** After an engine finishes, summarize what was found: how many IPs were scanned, how many ports were open, how many CVEs were discovered, etc.
+3. **Engine IDs.** Each engine tool returns an Engine ID. Always tell the user this ID for resumption.
 
-4. **Be honest about limitations.** If a scan finds no results, say so. If an error occurs, report the error clearly.
+4. **Report results clearly.** Summarize findings: IPs scanned, ports open, CVEs found, etc.
 
-5. **Long scans.** Full Nmap scans with all 65535 ports can take 5-20 minutes per IP. Warn the user about expected duration for large scans.
+5. **Be honest about limitations.** Report errors and empty results clearly.
 
-6. **Resume capability.** If the user asks to resume a previous scan, ask for the Engine ID. If they don't have it, tell them you cannot resume without the ID.
+6. **Long scans.** Warn users that full Nmap scans take 5-20 minutes per IP.
+
+7. **14-day freshness.** The scanners automatically skip IPs scanned within the last 14 days. Inform the user if their target was recently scanned.
+
+8. **Resume capability.** Users can resume scans with their Engine ID.
 """
 
 
@@ -363,11 +435,103 @@ def scan_cve_list(
     )
 
 
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Agent Builder
 # ═════════════════════════════════════════════════════════════════════════════
 
-TOOLS = [scan_natural_language_query, scan_ip_list, scan_cve_list]
+# ─── Custom DB Query Tool (results go to frontend, summary to LLM) ───────────────
+# Data marker for embedding query results in the tool output.
+# stream_agent extracts this data, strips it, and emits a db_results event.
+_QDATA_MARKER = "__QDATA__"
+_QDATA_END    = "__QEND__"
+
+@tool
+def query_database(
+    sql_query: Annotated[str, "The SQL SELECT query to run against the CTI database"],
+) -> str:
+    """Execute a read-only SQL query against the local CTI database.
+
+    Results are displayed directly to the user in a formatted table.
+    You (the agent) only receive a brief summary with row count and column names.
+    Do NOT try to repeat or reformat the data — it is already shown to the user.
+
+    Tips:
+      - Use ::inet cast for IP comparisons: WHERE ip = '1.2.3.4'::inet
+      - Join hosts → scans → ports → vulnerabilities for full IP data
+      - Join cve_details → cve_analysis → cve_mitre_mappings for full CVE data
+      - Use LIMIT to keep results manageable
+
+    Args:
+        sql_query: A valid PostgreSQL SELECT query.
+    """
+    import json as _json
+    import base64 as _b64
+    from sqlalchemy import text as sa_text
+
+    # Security: only SELECT / WITH allowed
+    stripped = sql_query.strip()
+    while stripped.startswith('--'):
+        stripped = stripped.split('\n', 1)[-1].strip() if '\n' in stripped else ''
+    while stripped.startswith('/*'):
+        end = stripped.find('*/')
+        stripped = stripped[end+2:].strip() if end != -1 else ''
+
+    if not stripped.upper().startswith(('SELECT', 'WITH')):
+        return "Only SELECT and WITH (CTE) queries are allowed."
+
+    try:
+        with _sql_engine.connect() as conn:
+            result = conn.execute(sa_text(sql_query))
+            columns = list(result.keys())
+            rows = result.fetchmany(100)
+
+            # Convert every cell to string for JSON serialization
+            serialized_rows = []
+            for row in rows:
+                serialized_rows.append([
+                    str(v)[:300] if v is not None else None
+                    for v in row
+                ])
+
+            total = len(serialized_rows)
+
+            if total == 0:
+                return "Query returned 0 rows. No matching data found in the database."
+
+            # Encode full results as base64 JSON and embed in the output.
+            # stream_agent will extract this, emit a db_results event,
+            # and strip the marker before forwarding to the frontend.
+            payload = _b64.b64encode(_json.dumps({
+                "query": sql_query,
+                "columns": columns,
+                "rows": serialized_rows,
+                "total": total,
+            }).encode()).decode()
+
+            col_list = ', '.join(columns)
+            summary = (
+                f"Query executed successfully. Returned {total} row(s) with columns: {col_list}. "
+                f"The full results are already visible to the user in a formatted table above. "
+                f"Do NOT create a table or list the data \u2014 just summarize what was found."
+            )
+            return f"{summary}\n{_QDATA_MARKER}{payload}{_QDATA_END}"
+    except Exception as e:
+        return f"SQL Error: {str(e)}"
+
+# Build schema-only tools from the prebuilt SQLDatabaseToolkit
+_db_toolkit_llm = ChatGroq(model=GROQ_MODEL, temperature=0)
+_db_toolkit = SQLDatabaseToolkit(db=_sql_db, llm=_db_toolkit_llm)
+# Keep only lightweight schema tools — query execution uses our custom tool above
+_db_schema_tools = [t for t in _db_toolkit.get_tools() if t.name in ('sql_db_list_tables', 'sql_db_schema')]
+
+TOOLS = [
+    query_database,     # Custom: results go to frontend, summary to LLM
+    *_db_schema_tools,  # sql_db_list_tables, sql_db_schema (from toolkit)
+    scan_natural_language_query,
+    scan_ip_list,
+    scan_cve_list,
+]
 
 
 def build_agent(checkpointer=None):
@@ -516,6 +680,22 @@ def stream_agent(
                             "tool": tool_name,
                             "output": output,
                         }
+
+                        # Extract embedded DB query results from tool output
+                        if _QDATA_MARKER in output:
+                            try:
+                                import json as _json, base64 as _b64
+                                b64_data = output.split(_QDATA_MARKER)[1].split(_QDATA_END)[0]
+                                rd = _json.loads(_b64.b64decode(b64_data).decode())
+                                yield {
+                                    "type": "db_results",
+                                    "query": rd["query"],
+                                    "columns": rd["columns"],
+                                    "rows": rd["rows"],
+                                    "total": rd["total"],
+                                }
+                            except Exception as ex:
+                                print(f"[Stream] Failed to extract db_results: {ex}")
                         
                         if engine_tid:
                             yield {
@@ -637,6 +817,22 @@ def resume_agent(thread_id: str, human_response: dict):
                             "tool": tool_name,
                             "output": output,
                         }
+
+                        # Extract embedded DB query results from tool output
+                        if _QDATA_MARKER in output:
+                            try:
+                                import json as _json, base64 as _b64
+                                b64_data = output.split(_QDATA_MARKER)[1].split(_QDATA_END)[0]
+                                rd = _json.loads(_b64.b64decode(b64_data).decode())
+                                yield {
+                                    "type": "db_results",
+                                    "query": rd["query"],
+                                    "columns": rd["columns"],
+                                    "rows": rd["rows"],
+                                    "total": rd["total"],
+                                }
+                            except Exception as ex:
+                                print(f"[Resume] Failed to extract db_results: {ex}")
                         
                         if engine_tid:
                             yield {
@@ -802,7 +998,7 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"  CTI AGENT — Interactive Chat")
     print(f"  Model: {GROQ_MODEL} (via Groq)")
-    print(f"  Tools: {len(TOOLS)} enumeration engines")
+    print(f"  Tools: {len(TOOLS)} ({1 + len(_db_schema_tools)} DB + 3 engines)")
     print(f"{'=' * 60}")
 
     # Check for past chat sessions

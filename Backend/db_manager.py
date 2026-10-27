@@ -647,7 +647,90 @@ class DBManager:
             """, (ip, engine_thread_id))
         self.conn.commit()
 
-    # ═════════════════════════════════════════════════════════════════════════
+    # ─── Staleness Check ─────────────────────────────────────────────────
+
+    def get_last_scan_date(self, ip: str, source: str = None):
+        """
+        Get the most recent scraped_at timestamp for an IP, optionally filtered by source.
+
+        Used by the 2-week staleness check: if the most recent scan is less than
+        14 days old, the IP can be skipped to avoid redundant scanning.
+
+        Args:
+            ip:     Target IP address string.
+            source: Optional filter by scan source ('shodan', 'nmap'). If None,
+                    returns the most recent scan across all sources.
+
+        Returns:
+            datetime object of the most recent scraped_at, or None if never scanned.
+        """
+        try:
+            with self.conn.cursor() as cur:
+                if source:
+                    cur.execute("""
+                        SELECT s.scraped_at
+                        FROM scans s
+                        JOIN hosts h ON h.id = s.host_id
+                        WHERE h.ip = %s::inet AND s.source = %s
+                        ORDER BY s.scraped_at DESC
+                        LIMIT 1
+                    """, (ip.strip(), source))
+                else:
+                    cur.execute("""
+                        SELECT s.scraped_at
+                        FROM scans s
+                        JOIN hosts h ON h.id = s.host_id
+                        WHERE h.ip = %s::inet
+                        ORDER BY s.scraped_at DESC
+                        LIMIT 1
+                    """, (ip.strip(),))
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception:
+            self.conn.rollback()
+            return None
+
+    def is_scan_stale(self, ip: str, source: str = None, max_age_days: int = 14) -> bool:
+        """
+        Check whether an IP needs re-scanning based on scan age.
+
+        Returns True if:
+          - The IP has never been scanned by the given source, OR
+          - The most recent scan is older than max_age_days (default 14 days).
+
+        Returns False if:
+          - A scan exists and is within the freshness window.
+
+        Args:
+            ip:           Target IP address.
+            source:       Optional source filter ('shodan', 'nmap').
+            max_age_days: Maximum age in days before a scan is considered stale.
+
+        Returns:
+            True if the IP should be (re-)scanned, False if data is fresh enough.
+        """
+        last_scan = self.get_last_scan_date(ip, source=source)
+        if last_scan is None:
+            return True  # Never scanned — needs scanning
+
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+
+        # Ensure last_scan is timezone-aware
+        if last_scan.tzinfo is None:
+            last_scan = last_scan.replace(tzinfo=timezone.utc)
+
+        age = now - last_scan
+        is_stale = age > timedelta(days=max_age_days)
+
+        if is_stale:
+            print(f"[*] Scan for {ip} (source={source}) is {age.days} days old — stale (>{max_age_days}d). Will re-scan.")
+        else:
+            print(f"[=] Scan for {ip} (source={source}) is {age.days} days old — fresh (<={max_age_days}d). Skipping.")
+
+        return is_stale
+
+
     # Query Helpers (for agent and scripts)
     # ═════════════════════════════════════════════════════════════════════════
 

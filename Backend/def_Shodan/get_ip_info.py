@@ -653,6 +653,17 @@ def get_ip_info_gen(ip_list, engine_thread_id: str = None):
             print(f"[{idx}/{total}] Processing IP: {target_ip}")
             print(f"{'='*60}")
 
+            # ── 2-Week Staleness Check ────────────────────────────────────
+            # If we already have a Shodan scan for this IP that is less than
+            # 14 days old, skip it entirely to save time and bandwidth.
+            if not db.is_scan_stale(target_ip, source="shodan", max_age_days=14):
+                print(f"[=] Skipping {target_ip} — Shodan data is fresh (scanned within 14 days).")
+                yield {
+                    "ip_data_fetcher_shodan": "running",
+                    "ip_data_fetcher_shodan_done": f"{idx}/{total}",
+                }
+                continue
+
             # ── Crash Recovery Check (from database) ─────────────────────
             stored_last_seen = db.get_latest_last_seen(target_ip, source="shodan")
 
@@ -844,6 +855,12 @@ def scrape_single_ip(page, db, target_ip: str) -> dict:
     target_ip = target_ip.strip()
     if not target_ip:
         return {"status": "error", "ip": target_ip, "reason": "Empty IP"}
+
+    # ── 2-Week Staleness Check ──────────────────────────────────────────
+    # If Shodan data for this IP is less than 14 days old, skip entirely.
+    if not db.is_scan_stale(target_ip, source="shodan", max_age_days=14):
+        print(f"[=] Skipping {target_ip} — Shodan data is fresh (scanned within 14 days).")
+        return {"status": "skipped", "ip": target_ip, "reason": "fresh data (scanned within 14 days)"}
 
     # ── Deduplication Check ──────────────────────────────────────────────
     stored_last_seen = db.get_latest_last_seen(target_ip, source="shodan")

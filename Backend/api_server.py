@@ -354,6 +354,30 @@ async def send_message(thread_id: str, request: MessageRequest):
                         except Exception:
                             pass
 
+                    # When db_results fires, save a markdown table for persistence
+                    if event.get("type") == "db_results" and assistant_row_id:
+                        try:
+                            cols = event.get("columns", [])
+                            rows = event.get("rows", [])
+                            total = event.get("total", 0)
+                            query = event.get("query", "")
+                            md_lines = [f"\n\n**Query Results** ({total} row{'s' if total != 1 else ''})\n"]
+                            md_lines.append(f"```sql\n{query}\n```\n")
+                            if cols:
+                                md_lines.append("| " + " | ".join(cols) + " |")
+                                md_lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
+                                for row in rows[:50]:
+                                    cells = [str(v).replace("|", "\\|")[:100] if v is not None else "\u2014" for v in row]
+                                    md_lines.append("| " + " | ".join(cells) + " |")
+                                if total > 50:
+                                    md_lines.append(f"\n*...and {total - 50} more rows*")
+                            md_table = "\n".join(md_lines) + "\n\n"
+                            db = ChatDB()
+                            db.append_token(assistant_row_id, md_table)
+                            db.close()
+                        except Exception:
+                            pass
+
                     loop.call_soon_threadsafe(sse_queue.put_nowait, event)
             except Exception as e:
                 loop.call_soon_threadsafe(

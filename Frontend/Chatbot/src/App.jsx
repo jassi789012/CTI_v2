@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Plus, MessageSquare, Send, Activity, ShieldAlert, CheckCircle2, ChevronRight, TerminalSquare, Trash2, Square, Clock, Pause, Play, X, AlertTriangle, Search } from 'lucide-react'
+import { Plus, MessageSquare, Send, Activity, ShieldAlert, CheckCircle2, ChevronRight, TerminalSquare, Trash2, Square, Clock, Pause, Play, X, AlertTriangle, Search, Database } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -36,6 +36,16 @@ const ENGINE_DISPLAY_NAMES = {
   scan_ip_list: 'IP Scanner Engine',
   scan_cve_list: 'CVE Research Engine',
 }
+
+// Display names for lightweight tool indicators (non-engine tools)
+const TOOL_DISPLAY_NAMES = {
+  query_database: { running: 'Querying database', done: 'Queried database' },
+  sql_db_schema: { running: 'Reading table schema', done: 'Read table schema' },
+  sql_db_list_tables: { running: 'Listing tables', done: 'Listed tables' },
+}
+
+// Engine tools that use the full ToolExecutionBlock with pipeline nodes
+const ENGINE_TOOL_NAMES = ['scan_natural_language_query', 'scan_ip_list', 'scan_cve_list']
 
 export default function App() {
   const [sessions, setSessions] = useState([])
@@ -967,8 +977,7 @@ export default function App() {
       else if (event.type === 'tool_start') {
         // Don't show tool block for engine tools — they'll show via the approval card
         // and engine progress panel instead
-        const engineTools = ['scan_natural_language_query', 'scan_ip_list', 'scan_cve_list']
-        if (engineTools.includes(event.tool)) {
+        if (ENGINE_TOOL_NAMES.includes(event.tool)) {
           return newMessages  // Skip — engine panel will handle display
         }
 
@@ -996,6 +1005,15 @@ export default function App() {
           toolsCopy[toolsCopy.length - 1] = activeTool
           lastMsg.tools = toolsCopy
         }
+      }
+      else if (event.type === 'db_results') {
+        // DB query results — render as a formatted table (data goes to frontend, not LLM)
+        lastMsg.queryResults = [...(lastMsg.queryResults || []), {
+          query: event.query,
+          columns: event.columns,
+          rows: event.rows,
+          total: event.total,
+        }]
       }
       else if (event.type === 'stopped') {
         lastMsg.content = (lastMsg.content || '') + '\n\n*Agent stopped by user.*'
@@ -1105,23 +1123,36 @@ export default function App() {
                   <div className="message-body">
                     {/* Render tool executions directly in place within the assistant message */}
                     {msg.role === 'assistant' && msg.tools && msg.tools.map((tool, tIdx) => {
-                      const isThisActive = activeEngine && (tool.engine_thread_id || tool.engine_id) === activeEngine.engine_thread_id
-                      const liveTool = isThisActive ? {
-                        ...tool,
-                        status: activeEngine.status,
-                        nodes: activeEngine.nodes || tool.nodes,
-                        error: activeEngine.error || tool.error,
-                      } : tool
+                      const toolName = tool.name || tool.tool_name
+                      
+                      // Engine tools use the full pipeline-style ToolExecutionBlock
+                      if (ENGINE_TOOL_NAMES.includes(toolName)) {
+                        const isThisActive = activeEngine && (tool.engine_thread_id || tool.engine_id) === activeEngine.engine_thread_id
+                        const liveTool = isThisActive ? {
+                          ...tool,
+                          status: activeEngine.status,
+                          nodes: activeEngine.nodes || tool.nodes,
+                          error: activeEngine.error || tool.error,
+                        } : tool
 
-                      return (
-                        <ToolExecutionBlock 
-                          key={tool.engine_thread_id || tool.engine_id || tIdx} 
-                          tool={liveTool} 
-                          onStop={handleStopEngine}
-                          onResume={handleResumeEngine} 
-                        />
-                      )
+                        return (
+                          <ToolExecutionBlock 
+                            key={tool.engine_thread_id || tool.engine_id || tIdx} 
+                            tool={liveTool} 
+                            onStop={handleStopEngine}
+                            onResume={handleResumeEngine} 
+                          />
+                        )
+                      }
+                      
+                      // DB tools and other tools use the lightweight indicator
+                      return <ToolUseIndicator key={`tool-${tIdx}`} tool={tool} />
                     })}
+
+                    {/* Render DB query results as formatted tables */}
+                    {msg.queryResults && msg.queryResults.map((result, rIdx) => (
+                      <QueryResultsTable key={`qr-${rIdx}`} data={result} />
+                    ))}
                     
                     {/* Render markdown text with GFM plugin for tables and client-side links */}
                     {msg.content && (
@@ -1680,6 +1711,138 @@ function ToolExecutionBlock({ tool, onStop, onResume }) {
           )
         })}
       </div>
+    </div>
+  )
+}
+
+
+/**
+ * Lightweight tool use indicator for non-engine tools (DB queries, schema lookups, etc.)
+ * Shows a compact, collapsible card similar to modern chatbot tool indicators.
+ */
+function ToolUseIndicator({ tool }) {
+  const [isExpanded, setIsExpanded] = useState(false)
+  const toolName = tool.name || tool.tool_name
+  const displayInfo = TOOL_DISPLAY_NAMES[toolName] || { running: toolName, done: toolName }
+  const isRunning = tool.status === 'running'
+  const displayName = isRunning ? displayInfo.running : displayInfo.done
+
+  // Extract readable input summary
+  const getInputSummary = () => {
+    if (!tool.input) return null
+    if (tool.input.query) return tool.input.query
+    if (tool.input.table_names) return tool.input.table_names
+    if (typeof tool.input === 'string') return tool.input
+    const entries = Object.entries(tool.input)
+    if (entries.length === 0) return null
+    return JSON.stringify(tool.input, null, 2)
+  }
+
+  const inputSummary = getInputSummary()
+  const hasDetails = inputSummary || tool.output
+
+  return (
+    <div
+      className={`tool-use-indicator ${tool.status}`}
+      onClick={() => hasDetails && setIsExpanded(!isExpanded)}
+      style={{ cursor: hasDetails ? 'pointer' : 'default' }}
+    >
+      <div className="tool-use-header">
+        <div className="tool-use-icon">
+          {isRunning
+            ? <Activity size={14} className="spin" />
+            : <CheckCircle2 size={14} />
+          }
+        </div>
+        <Database size={14} className="tool-use-db-icon" />
+        <span className="tool-use-name">
+          {displayName}{isRunning ? '...' : ''}
+        </span>
+        {hasDetails && (
+          <ChevronRight
+            size={14}
+            className={`tool-use-chevron ${isExpanded ? 'expanded' : ''}`}
+          />
+        )}
+      </div>
+      {isExpanded && hasDetails && (
+        <div className="tool-use-details">
+          {inputSummary && (
+            <div className="tool-use-section">
+              <span className="tool-use-label">Input</span>
+              <code className="tool-use-code">{inputSummary}</code>
+            </div>
+          )}
+          {tool.output && (
+            <div className="tool-use-section">
+              <span className="tool-use-label">Result</span>
+              <pre className="tool-use-code">
+                {typeof tool.output === 'string' && tool.output.length > 800
+                  ? tool.output.substring(0, 800) + '\n... (truncated)'
+                  : tool.output}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+/**
+ * Formatted table for DB query results.
+ * Shows a collapsible card with the SQL query and a styled results table.
+ * Data comes directly from the backend (not through the LLM).
+ */
+function QueryResultsTable({ data }) {
+  const [isExpanded, setIsExpanded] = useState(true)
+  const { query, columns, rows, total } = data
+
+  return (
+    <div className="query-results-card">
+      <div className="query-results-header" onClick={() => setIsExpanded(!isExpanded)}>
+        <Database size={15} className="query-results-icon" />
+        <span className="query-results-title">
+          Query Results
+          <span className="query-results-count">{total} row{total !== 1 ? 's' : ''}</span>
+        </span>
+        <ChevronRight
+          size={14}
+          className={`query-results-chevron ${isExpanded ? 'expanded' : ''}`}
+        />
+      </div>
+      {isExpanded && (
+        <div className="query-results-body">
+          <div className="query-results-sql">
+            <code>{query}</code>
+          </div>
+          {columns.length > 0 && rows.length > 0 ? (
+            <div className="query-results-table-wrap">
+              <table className="query-results-table">
+                <thead>
+                  <tr>
+                    {columns.map((col, i) => (
+                      <th key={i}>{col}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((row, i) => (
+                    <tr key={i}>
+                      {row.map((val, j) => (
+                        <td key={j}>{val ?? '—'}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="query-results-empty">No rows returned</div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
