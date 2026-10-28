@@ -6,7 +6,7 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16%2B-336791.svg)](https://www.postgresql.org/)
 [![Playwright](https://img.shields.io/badge/Playwright-1.63%2B-45ba4b.svg)](https://playwright.dev/)
 
-The **CTI_V2 Backend** is a high-performance Cyber Threat Intelligence platform built on FastAPI, LangGraph, and PostgreSQL. It delivers automated OSINT discovery, a 9-phase full-spectrum Nmap scanner, zero-cost AI threat modeling with account-rotated ChatGPT automation, NIST NVD API v2 enrichment, and a ReAct security analyst agent with Human-in-the-Loop (HITL) authorization gates.
+The **CTI_V2 Backend** is a high-performance Cyber Threat Intelligence platform built on FastAPI, LangGraph, and PostgreSQL. It delivers automated OSINT discovery, a 9-phase full-spectrum Nmap scanner, 8-source parallel CVE enrichment (NVD, CVE.org, EPSS, CISA KEV, OSV.dev, Exploit-DB, CWE, MITRE ATT&CK), and a ReAct security analyst agent with Human-in-the-Loop (HITL) authorization gates.
 
 ---
 
@@ -29,9 +29,9 @@ The **CTI_V2 Backend** is a high-performance Cyber Threat Intelligence platform 
   - [Checkpointing & Resumption](#checkpointing--resumption)
   - [Advanced NSE Analyzers & Posture Assessment](#advanced-nse-analyzers--posture-assessment)
 - [Shodan Scraping Module (`def_Shodan/`)](#shodan-scraping-module-def_shodan)
-- [Dual-Source CVE Enrichment & Multi-Account Rotator (`cve_maper/`)](#dual-source-cve-enrichment--multi-account-rotator-cve_maper)
+- [8-Source OSINT CVE Enrichment (`cve_maper/`)](#8-source-osint-cve-enrichment-cve_maper)
   - [NIST NVD API Client](#nist-nvd-api-client)
-  - [ChatGPT Browser Automation & Account Rotator](#chatgpt-browser-automation--account-rotator)
+  - [Parallel OSINT Sources](#parallel-osint-sources)
 - [Engine Lifecycle Coordinator (`engine_manager.py`)](#engine-lifecycle-coordinator-engine_managerpy)
 - [Database Schema & Persistence (`db_manager.py`)](#database-schema--persistence-db_managerpy)
   - [Reconnaissance Schema (10 Tables)](#reconnaissance-schema-10-tables)
@@ -80,7 +80,7 @@ The **CTI_V2 Backend** is a high-performance Cyber Threat Intelligence platform 
 │  • def_Shodan: Playwright Chromium scraper, session cookies, host diff engine       │
 │  • def_nmap: 9-Phase full-spectrum scanner (TCP, UDP, OS, Vuln, NSE, ACK, SCTP)     │
 │  • cve_extractor: Service banner normalization and CVE regex extraction             │
-│  • cve_mapper: NIST NVD API v2 + Playwright Headless ChatGPT account rotator        │
+│  • cve_mapper: 8-source parallel OSINT enrichment (NVD, CVE.org, EPSS, KEV, OSV, ExploitDB, CWE, ATT&CK) │
 └──────────────────────────────────────────┬──────────────────────────────────────────┘
                                            │
                                            ▼
@@ -127,7 +127,7 @@ Located in [`Backend/api_server.py`](file:///c:/Users/jassi/OneDrive/Documents/C
 | `GET` | `/api/search/filters` | Returns all 43 supported Shodan search filters grouped by category | None |
 | `GET` | `/api/search` | Queries local database using Shodan filter syntax with pagination | `q` (string), `page` (int), `page_size` (int) |
 | `GET` | `/api/search/ip/{ip_address}` | Retrieves full host profile, Nmap active data, Shodan passive data, ACK firewall posture, and CVEs | Path: `ip_address` |
-| `GET` | `/api/search/cve/{cve_id}` | Retrieves full NVD metrics, CPEs, ChatGPT ATT&CK analysis, and **affected local scanned assets** | Path: `cve_id` |
+| `GET` | `/api/search/cve/{cve_id}` | Retrieves full NVD metrics, CPEs, OSINT enrichment (EPSS, KEV, ATT&CK), and **affected local scanned assets** | Path: `cve_id` |
 
 ### Platform Health & Statistics (2)
 
@@ -173,7 +173,7 @@ Executes an end-to-end reconnaissance lifecycle starting from a natural language
 2. **`get_ip`**: Launches Playwright Chromium with cached cookies (`shodan_cookies.json`) and extracts up to `max_ips` (default 5) target IP addresses.
 3. **`process_all_ips`**: Concurrently initiates Shodan host extraction (`def_Shodan/get_ip_info.py`) and the 9-phase Nmap scanner (`def_nmap/nmap_scanner.py`) across all discovered IPs.
 4. **`extract_cves`**: Normalizes all discovered service banners, raw outputs, and NSE script results with regular expressions to identify mentioned CVE IDs.
-5. **`cve_mapper`**: Enriches all extracted CVEs via the NIST NVD API v2 and the headless ChatGPT browser session.
+5. **`cve_mapper`**: Enriches all extracted CVEs from 8 OSINT sources in parallel (NVD, CVE.org, EPSS, CISA KEV, OSV.dev, Exploit-DB, CWE, MITRE ATT&CK).
 6. **`summary`**: Aggregates all discovered hosts, ports, and vulnerabilities into an executive analytical briefing.
 
 ### 2. Direct IP Scanner Engine (`Engine_ip_input.py`)
@@ -186,7 +186,7 @@ Bypasses Shodan query generation when an analyst provides specific IP addresses:
 
 - Deduplicates IPv4 addresses.
 - Executes parallel Shodan passive scraping and 9-phase Nmap active scanning.
-- Extracts and enriches vulnerabilities via NVD and ChatGPT.
+- Extracts and enriches vulnerabilities via 8 OSINT sources.
 
 ### 3. CVE Research Engine (`Engine_cve_input.py`)
 
@@ -198,7 +198,7 @@ Dedicated vulnerability intelligence pipeline for analyzing specific CVE identif
 
 - Accepts a list of CVE IDs (e.g., `CVE-2024-21626`).
 - Queries NIST NVD for CVSS scores, CWE classification, and CPE configurations.
-- Prompts ChatGPT to build step-by-step root cause walkthroughs, MITRE ATT&CK tactical mappings, and defensive recommendations.
+- Enriches each CVE from 8 parallel OSINT sources (NVD, CVE.org, EPSS, CISA KEV, OSV.dev, Exploit-DB, CWE, MITRE ATT&CK STIX).
 
 ---
 
@@ -288,23 +288,19 @@ Located in [`Backend/cve_maper/`](file:///c:/Users/jassi/OneDrive/Documents/CTI_
 - Normalizes CVSS base scores and vectors (CVSS v3.1, v3.0, and v2.0).
 - Extracts CWE taxonomies, official references, and Common Platform Enumeration (CPE) configurations.
 
-### ChatGPT Browser Automation & Account Rotator
-To perform in-depth threat intelligence without enterprise LLM costs, CTI_V2 automates free ChatGPT sessions using Playwright persistent browser contexts:
-- **Account Profiles**: Stored in `Backend/cve_maper/.accounts/`.
-- **Account Rotator CLI (`add_chatgpt_account.py`)**:
-  ```bash
-  cd Backend/cve_maper
-  python add_chatgpt_account.py
-  ```
-  Prompts the user to log in manually via an interactive browser window once. The session cookies and storage state are saved to disk.
-- **Automatic Session Switching**:
-  When ChatGPT returns an hourly message limit warning, the system automatically rotates to the next available browser profile in `.accounts/`.
-- **Structured JSON Extraction**:
-  Enforces a strict JSON response schema containing:
-  - Technical vulnerability root-cause walkthrough.
-  - Active in-the-wild exploitation status (CISA KEV, PoC availability).
-  - MITRE ATT&CK Matrix mapping: Tactical stages (TA0001–TA0043) and Techniques (T1190, T1059, etc.) with technical justification.
-  - Actionable mitigation checklists and threat-hunting detection queries.
+### Parallel OSINT Sources
+For each CVE, 8 public intelligence sources are queried **in parallel** via `ThreadPoolExecutor(max_workers=8)` with independent per-source rate limiters:
+
+| # | Source | Data Provided | Rate Limiting |
+|---|--------|---------------|---------------|
+| 1 | **NVD** | CVSS scores, CWE, CPE, severity, description | Rolling window (50 req/30s with key) |
+| 2 | **CVE.org** | CNA record, additional references, timeline | 8 req/10s |
+| 3 | **FIRST EPSS** | Exploit probability score (0–1), percentile | 20 req/10s |
+| 4 | **CISA KEV** | Known exploited status, remediation deadline, ransomware | Cached catalog (24h TTL) |
+| 5 | **OSV.dev** | Affected open-source packages, fix versions | 15 req/10s |
+| 6 | **Exploit-DB** | Public exploit/PoC links, EDB IDs | 3 req/10s |
+| 7 | **CWE Catalog** | Weakness details, mitigations, detection methods | CWE API |
+| 8 | **MITRE ATT&CK** | CWE→technique→tactic mappings via STIX | Cached STIX (24h TTL) |
 
 ---
 
@@ -371,7 +367,7 @@ CTI_V2 uses PostgreSQL (`cti_db`). Tables are initialized automatically on start
 5. **`technologies`**: Detected web server components, frameworks, and programming languages.
 6. **`cve_details`**: Normalized NIST NVD intelligence (CVSS base scores, CWE IDs, descriptions, reference URLs).
 7. **`cve_affected_products`**: Common Platform Enumeration (CPE) software and hardware matrices.
-8. **`cve_analysis`**: ChatGPT threat analyses, including technical walkthroughs, mitigation checklists, and threat-hunting rules.
+8. **`cve_analysis`**: OSINT enrichment analyses (EPSS, KEV, CWE-based mitigations, exploit references, ATT&CK mappings).
 9. **`cve_mitre_mappings`**: MITRE ATT&CK tactics (TA0001–TA0043) and techniques (T1190, T1059, etc.) linked to threat analyses.
 10. **`nmap_scan_checkpoints`**: Per-phase state checkpoints (`ip`, `engine_thread_id`, `last_phase`, `state_data`).
 
@@ -440,7 +436,7 @@ python Backend/Engine_cve_input.py
 # Verify Database Connection & Tables:
 python Backend/db_manager.py
 
-# Register a new ChatGPT Account profile:
+# Run standalone CVE enrichment (8 OSINT sources):
 cd Backend/cve_maper
-python add_chatgpt_account.py
+python cve_mapper.py CVE-2024-1234,CVE-2023-5678
 ```

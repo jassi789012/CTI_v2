@@ -34,7 +34,7 @@ from get_ip_info import get_ip_info_gen
 from nmap_scanner import nmap_scan_ips_gen
 from db_manager import DBManager
 from cve_extractor import extract_cves_gen
-from cve_mapper import fetch_nvd_gen, enrich_gpt_gen
+from cve_mapper import enrich_all_sources_gen
 from engine_progress import emit_progress, is_cancelled, get_context, set_context, clear_context
 
 # ─── Load .env ───────────────────────────────────────────────────────────────
@@ -71,10 +71,8 @@ class EngineState(TypedDict):
     ip_data_fetcher_nmap_done: str
     cve_extractor: str
     cve_extractor_done: str
-    cve_mapper_nvd: str
-    cve_mapper_nvd_done: str
-    cve_mapper_gpt: str
-    cve_mapper_gpt_done: str
+    cve_enrichment: str
+    cve_enrichment_done: str
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -267,42 +265,20 @@ def extract_cves_node(state: EngineState) -> dict:
 def cve_mapper_node(state: EngineState) -> dict:
     cves = state.get("cve", [])
     
-    nvd_results = {}
-    emit_progress("cve_mapper", "running", "Fetching NVD data")
-    for progress in fetch_nvd_gen(cves):
+    emit_progress("cve_mapper", "running", "Enriching CVEs (8 sources parallel)")
+    for progress in enrich_all_sources_gen(cves):
         if is_cancelled():
             raise InterruptedError("Engine cancelled by user")
-        status = progress.get("nvd_data_fetcher", "running")
-        done = progress.get("nvd_data_fetcher_done", "0/0")
-        nvd_results = progress.get("nvd_results", nvd_results)
-        emit_progress("cve_mapper", "running", f"NVD: {done}")
-        print(f"\r[Mapper NVD] Status: {status} | Progress: {done}", end="")
-    print()
-        
-    db = DBManager()
-    db.init_tables()
-    cves_needing_analysis = []
-    for cve_id in nvd_results:
-        if not db.check_cve_analysis_exists(cve_id):
-            cves_needing_analysis.append(cve_id)
-    db.close()
-    
-    emit_progress("cve_mapper", "running", f"GPT enriching {len(cves_needing_analysis)} CVEs")
-    for progress in enrich_gpt_gen(cves_needing_analysis, nvd_results):
-        if is_cancelled():
-            raise InterruptedError("Engine cancelled by user")
-        status = progress.get("cve_mapper_gpt", "running")
-        done = progress.get("cve_mapper_gpt_done", "0/0")
-        emit_progress("cve_mapper", "running", f"GPT: {done}")
-        print(f"\r[Mapper GPT] Status: {status} | Progress: {done}", end="")
+        status = progress.get("cve_enrichment", "running")
+        done = progress.get("cve_enrichment_done", "0/0")
+        emit_progress("cve_mapper", "running", f"Enrichment: {done}")
+        print(f"\r[Mapper] Status: {status} | Progress: {done}", end="")
     print()
     
-    emit_progress("cve_mapper", "done", f"{len(cves)} CVEs mapped")
+    emit_progress("cve_mapper", "done", f"{len(cves)} CVEs enriched")
     return {
-        "cve_mapper_nvd": "completed",
-        "cve_mapper_nvd_done": f"{len(cves)}/{len(cves)}" if cves else "0/0",
-        "cve_mapper_gpt": "completed",
-        "cve_mapper_gpt_done": f"{len(cves_needing_analysis)}/{len(cves_needing_analysis)}" if cves_needing_analysis else "0/0"
+        "cve_enrichment": "completed",
+        "cve_enrichment_done": f"{len(cves)}/{len(cves)}" if cves else "0/0",
     }
 
 
@@ -400,10 +376,8 @@ def run_engine(
             "ip_data_fetcher_nmap_done": "0/0",
             "cve_extractor": "waiting for ips",
             "cve_extractor_done": "0/0",
-            "cve_mapper_nvd": "waiting for cves",
-            "cve_mapper_nvd_done": "0/0",
-            "cve_mapper_gpt": "waiting for cves",
-            "cve_mapper_gpt_done": "0/0",
+            "cve_enrichment": "waiting for cves",
+            "cve_enrichment_done": "0/0",
         }
 
         return graph.invoke(initial_state, config)

@@ -8,7 +8,7 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16%2B-336791.svg)](https://www.postgresql.org/)
 [![Playwright](https://img.shields.io/badge/Playwright-1.63%2B-45ba4b.svg)](https://playwright.dev/)
 
-**CTI_V2** is a modular, AI-powered Cyber Threat Intelligence (CTI) and automated reconnaissance platform. It combines automated OSINT discovery, full-spectrum 9-phase port scanning, dual-source vulnerability enrichment, and an autonomous AI ReAct agent with Human-in-the-Loop verification—all managed through a responsive, cyberpunk-inspired web interface with live streaming progress, checkpointing, and pause/resume execution controls.
+**CTI_V2** is a modular, AI-powered Cyber Threat Intelligence (CTI) and automated reconnaissance platform. It combines automated OSINT discovery, full-spectrum 8-phase port scanning, dual-source vulnerability enrichment, and an autonomous AI ReAct agent with Human-in-the-Loop verification—all managed through a responsive, cyberpunk-inspired web interface with live streaming progress, checkpointing, and pause/resume execution controls.
 
 ---
 
@@ -19,9 +19,9 @@
 - [Core Engines & Pipelines](#core-engines--pipelines)
 - [AI Agent & Human-in-the-Loop](#ai-agent--human-in-the-loop)
 - [Deep Reconnaissance & Scanning](#deep-reconnaissance--scanning)
-  - [9-Phase Nmap Engine](#9-phase-nmap-engine)
+  - [8-Phase Nmap Engine](#8-phase-nmap-engine)
   - [Shodan Web Scraping Automation](#shodan-web-scraping-automation)
-  - [Dual-Source CVE Mapping (NVD + ChatGPT)](#dual-source-cve-mapping-nvd--chatgpt)
+  - [8-Source OSINT CVE Enrichment](#8-source-osint-cve-enrichment)
 - [Web Applications & UI](#web-applications--ui)
   - [1. AI Threat Analyst Chat (`/` & `/chat`)](#1-ai-threat-analyst-chat---chat)
   - [2. Threat Search Engine (`/search`)](#2-threat-search-engine-search)
@@ -41,12 +41,13 @@
   - [3. Playwright Browser Installation](#3-playwright-browser-installation)
   - [4. PostgreSQL Configuration](#4-postgresql-configuration)
   - [5. Environment Variables (`.env`)](#5-environment-variables-env)
-  - [6. ChatGPT Accounts Setup](#6-chatgpt-accounts-setup)
+
 - [Running the Platform](#running-the-platform)
   - [Starting the API Server](#starting-the-api-server)
   - [Starting the Frontend UI](#starting-the-frontend-ui)
   - [CLI Interactive Mode](#cli-interactive-mode)
 - [Project Directory Structure](#project-directory-structure)
+- [Contributing](#contributing)
 - [Ethics & Disclaimer](#ethics--disclaimer)
 - [License & Author](#license--author)
 
@@ -60,12 +61,12 @@
 - **Human-in-the-Loop (HITL) Safeguards**: LangGraph interrupt mechanisms pause execution before launching active scans, requesting user authorization via interactive approval cards.
 - **Three Specialized Recon Engines**:
   - **Natural Language Query Engine**: Converts conversational queries (e.g. *"Find vulnerable Apache servers in Germany"*) into Shodan search dorks, discovers IPs, runs deep scans, and maps CVEs.
-  - **Direct IP Scanner Engine**: Performs 9-phase deep scans and Shodan reconnaissance directly on target IP lists.
-  - **CVE Research Engine**: Directly fetches NVD metrics and runs automated ChatGPT MITRE ATT&CK mapping and exploit walkthroughs on specific CVE IDs.
+  - **Direct IP Scanner Engine**: Performs 8-phase deep scans and Shodan reconnaissance directly on target IP lists.
+  - **CVE Research Engine**: Enriches CVE IDs from 8 public intelligence sources (NVD, CVE.org, FIRST EPSS, CISA KEV, OSV.dev, Exploit-DB, CWE, MITRE ATT&CK) in parallel with per-source rate limiting.
 - **14-Day Scan Staleness Check**: Scanners automatically skip IPs that were scanned within the last 14 days to avoid redundant work. The agent informs users when data is fresh.
-- **9-Phase Full-Spectrum Nmap Scanner**: Sequential multi-phase scanner with automated TCP, UDP, Service detection, OS fingerprinting, 64 NSE enumeration scripts, SSL ciphers, WHOIS/DNS/GeoIP, ACK firewall detection, IP protocols, and SCTP scans.
+- **8-Phase Full-Spectrum Nmap Scanner**: Sequential multi-phase scanner with combined TCP + Service + OS fingerprinting, UDP, vulnerability scripts, 72 NSE enumeration scripts across 16 categories, GeoIP/WHOIS/DNS, ACK firewall detection, IP protocols, and SCTP scans.
 - **Per-Phase Checkpointing & Resumption**: Every Nmap phase and LangGraph engine step writes state to PostgreSQL, allowing immediate pause and resume without losing prior progress.
-- **Zero-Cost LLM Enrichment**: Headless Playwright ChatGPT browser automation with persistent session profiles, multi-account rotation, anti-bot mitigation, and robust JSON schema extraction.
+- **8-Source OSINT CVE Enrichment**: Parallel `ThreadPoolExecutor`-driven enrichment from NVD, CVE.org, FIRST EPSS, CISA KEV, OSV.dev, Exploit-DB, CWE Catalog, and MITRE ATT&CK STIX — with thread-safe per-source rate limiters and 24-hour cached catalogs for KEV/CWE/ATT&CK.
 - **Live SSE Streaming**: FastAPI server streams agent reasoning tokens and engine step-by-step execution metrics over Server-Sent Events (SSE).
 - **Modern Chatbot UI with Tool Indicators**: Built with React 19, Vite, and Lucide icons — featuring collapsible tool execution indicators (like modern AI chatbots), formatted query result tables, real-time node progress trackers, pause/resume/stop controls, and GFM markdown rendering.
 
@@ -88,9 +89,9 @@
 │                                     FASTAPI BACKEND (api_server.py)                                    │
 │  • 17 REST & SSE Endpoints             • Server-Sent Events (SSE) Streaming • 43-Filter Dork Search   │
 │  • Human-in-the-Loop Interruption      • Background Engine Thread Manager   • Local CTI Data APIs      │
-└───────────────────────────┬───────────────────────────────────────────┬────────────────────────────────┘
-                            │                                           │
-                            ▼                                           ▼
+└───────────────────────────┬───────────────────────────────────────┬────────────────────────────────────┘
+                            │                                       │
+                            ▼                                       ▼
 ┌──────────────────────────────────────────────┐       ┌─────────────────────────────────────────────────┐
 │          MAIN AGENT (main_agent.py)          │       │         ENGINE MANAGER (engine_manager.py)      │
 │  • LangGraph ReAct Agent Loop                │       │  • Background Thread Coordination & Execution   │
@@ -106,7 +107,7 @@
 │  ┌───────────────────────────────────┐ ┌────────────────────────────────┐ ┌───────────────────────────┐  │
 │  │     Engine_query_input.py         │ │      Engine_ip_input.py        │ │    Engine_cve_input.py    │  │
 │  │ Natural Language Target Discovery │ │ Direct IP Reconnaissance       │ │ Pure Vulnerability        │  │
-│  │ Shodan Dorking -> Active Scans    │ │ Shodan Passive + 9-Phase Nmap  │ │ Research & ATT&CK Mapping │  │
+│  │ Shodan Dorking -> Active Scans    │ │ Shodan Passive + 8-Phase Nmap  │ │ Research & ATT&CK Mapping │  │
 │  └─────────────────┬─────────────────┘ └───────────────┬────────────────┘ └─────────────┬─────────────┘  │
 └────────────────────┼───────────────────────────────────┼────────────────────────────────┼────────────────┘
                      ▼                                   ▼                                ▼
@@ -114,16 +115,16 @@
 │                                        COLLECTION & ENRICHMENT                                         │
 │  • query_gen_ai: Groq-powered natural language to Shodan search query generator                       │
 │  • def_Shodan: Playwright Chromium authenticated scraper, cookie session pool, and diffing engine      │
-│  • def_nmap: 9-Phase full-spectrum Nmap engine with per-phase state checkpointing & ACK firewall audit │
+│  • def_nmap: 8-Phase full-spectrum Nmap engine with per-phase state checkpointing & ACK firewall audit │
 │  • cve_extractor: Regex and banner normalization for multi-port CVE extraction                        │
-│  • cve_mapper: Dual-source enrichment via NIST NVD API v2 + Playwright Headless ChatGPT account rotator│
+│  • cve_mapper: 8-source parallel OSINT enrichment (NVD, CVE.org, EPSS, KEV, OSV, Exploit-DB, CWE, ATT&CK)  │
 └───────────────────────────────────────────────────┬────────────────────────────────────────────────────┘
                                                     │
                                                     ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                       POSTGRESQL DATABASE (cti_db)                                     │
 │  • CTI Intelligence: hosts, scans, ports, vulnerabilities, technologies, cve_details,                 │
-│    cve_affected_products (CPEs), cve_analysis, cve_mitre_mappings                                     │
+│    cve_affected_products, cve_analysis, cve_mitre_mappings                                             │
 │  • AI & ATT&CK: cve_analysis (walkthroughs, mitigations, detection), cve_mitre_mappings (tactics, tech)│
 │  • Checkpoints: nmap_scan_checkpoints, checkpoints, checkpoint_blobs, checkpoint_writes                │
 │  • Chat & Session State: chat_messages, tool_calls                                                     │
@@ -137,29 +138,29 @@
 ### 1. Natural Language Query Engine (`Engine_query_input.py`)
 Executes the full reconnaissance lifecycle starting from an analytical query:
 1. **Query Generation (`query_gen`)**: Groq LLM parses the user prompt into valid Shodan search dorks (e.g., `product:Apache country:IN`).
-2. **IP Discovery (`get_ip`)**: Playwright navigates Shodan search results to extract target IP addresses.
-3. **Parallel Scanning (`process_all_ips`)**: Concurrently launches Shodan host page data fetching and the 9-phase Nmap scanner.
+2. **IP Discovery (`get_ips`)**: Playwright navigates Shodan search results to extract target IP addresses.
+3. **Parallel Scanning (`process_all_ips`)**: Concurrently launches Shodan host page data fetching and the 8-phase Nmap scanner.
 4. **CVE Extraction (`extract_cves`)**: Aggregates service banners and outputs to identify mentioned CVE IDs.
-5. **Vulnerability Enrichment (`cve_mapper`)**: Fetches NVD CVSS scores and generates ChatGPT MITRE ATT&CK mappings and vulnerability walkthroughs.
+5. **Vulnerability Enrichment (`cve_mapper`)**: Fetches data from 8 OSINT sources in parallel (NVD, CVE.org, EPSS, CISA KEV, OSV.dev, Exploit-DB, CWE, MITRE ATT&CK).
 6. **Summary Generation (`summary`)**: Compiles intelligence into structured database records and returns a concise executive summary.
 
 ### 2. Direct IP Scanner Engine (`Engine_ip_input.py`)
 Bypasses query generation when the analyst already has target IP addresses:
 - Deduplicates and normalizes target IPv4 addresses.
-- Executes parallel Shodan host extraction and the 9-phase Nmap scanner.
-- Performs CVE extraction, NVD querying, and ChatGPT threat enrichment.
+- Executes parallel Shodan host extraction and the 8-phase Nmap scanner.
+- Performs CVE extraction and 8-source OSINT enrichment.
 
 ### 3. CVE Research Engine (`Engine_cve_input.py`)
 Used for targeted vulnerability research:
 - Accepts a list of CVE IDs (e.g., `CVE-2024-21626`, `CVE-2023-38606`).
 - Queries the NIST NVD API for CVSS base scores, CWE categorization, and CPE affected products.
-- Uses the ChatGPT Playwright session to build exploitation walkthroughs, attack vector analyses, and defensive recommendations.
+- Enriches each CVE from 8 OSINT sources in parallel (NVD, CVE.org, FIRST EPSS, CISA KEV, OSV.dev, Exploit-DB, CWE Catalog, MITRE ATT&CK STIX).
 
 ---
 
 ## AI Agent & Human-in-the-Loop
 
-The agent is implemented using **LangGraph ReAct** architecture in [`Backend/main_agent.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/main_agent.py):
+The agent is implemented using **LangGraph ReAct** architecture in [`main_agent.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/main_agent.py):
 
 - **Database-First Routing**: The agent always checks the local PostgreSQL database before launching any scan engine, presenting existing results immediately and only suggesting scans when data is missing or stale.
 - **Prebuilt SQL Toolkit**: Uses LangChain's `SQLDatabaseToolkit` for schema exploration (`sql_db_list_tables`, `sql_db_schema`) plus a custom `query_database` tool for token-optimized SQL execution. The database connection is enforced read-only at the PostgreSQL level.
@@ -173,40 +174,44 @@ The agent is implemented using **LangGraph ReAct** architecture in [`Backend/mai
 
 ## Deep Reconnaissance & Scanning
 
-### 9-Phase Nmap Engine
-Located in [`Backend/def_nmap/nmap_scanner.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/def_nmap/nmap_scanner.py):
+### 8-Phase Nmap Engine
+Located in [`nmap_scanner.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/def_nmap/nmap_scanner.py):
 
 | Phase | Name | Arguments / Description |
 |---|---|---|
-| **1** | Fast TCP Discovery | `-sS -T4 -p 1-65535 --open --reason` (all 65535 ports) |
-| **2** | Service & OS Detection | `-sV --version-intensity 5 -sC -O -T4 --traceroute` on open ports |
-| **3** | UDP Scan | `-sU -sV -T4 --top-ports 500 --version-intensity 0 --open` |
-| **4** | Vulnerability Scripts | `-sV -T4 --script vuln,vulners` on discovered ports |
-| **5** | NSE Enumeration | 64 targeted NSE scripts (SSL ciphers, heartbleed, HTTP headers, WAF, robots, SMB, SSH) |
-| **6** | GeoIP & WHOIS | `-sn --script ip-geolocation-geoplugin,whois-ip,dns-brute,fcrdns` |
-| **7** | Firewall Detection | `-sA -T4` (TCP ACK scan to identify stateful firewalls & filtered ports) |
-| **8** | IP Protocol Scan | `-sO -T4` (discovers supported layer-4 protocols: ICMP, IGMP, TCP, UDP, GRE, ESP) |
-| **9** | SCTP Scan | `-sY -T4 --top-ports 100 --open` (identifies telecom & signaling interfaces) |
+| **1** | TCP + Service + OS Discovery | `-sS -sV --version-intensity 9 -sC -O -T4 -p 1-65535 --open --traceroute` (all 65535 ports with service detection, OS fingerprinting, and traceroute) |
+| **2** | UDP Scan | `-sU -sV -T4 --top-ports 500 --version-intensity 0 --open` |
+| **3** | Vulnerability Scripts | `-sV -T4 --script vuln,vulners` on discovered ports |
+| **4** | NSE Enumeration | 72 targeted NSE scripts across 16 categories (SSL/TLS, HTTP, DNS, SSH, SMB, SNMP, Databases, Mail, FTP, RDP, VNC, NTP, LDAP, Telnet, SIP/VoIP, Docker/K8s, XMPP, MQTT/IoT) |
+| **5** | GeoIP & WHOIS | `-sn --script ip-geolocation-geoplugin,whois-ip,dns-brute,fcrdns` |
+| **6** | Firewall Detection | `-sA -T4` (TCP ACK scan to identify stateful firewalls & filtered ports) |
+| **7** | IP Protocol Scan | `-sO -T4` (discovers supported layer-4 protocols: ICMP, IGMP, TCP, UDP, GRE, ESP) |
+| **8** | SCTP Scan | `-sY -T4 --top-ports 100 --open` (identifies telecom & signaling interfaces) |
 
 Every phase writes its progress to `nmap_scan_checkpoints`. If a scan is stopped or interrupted, resumption automatically skips already completed phases.
 
 ### Shodan Web Scraping Automation
-Located in [`Backend/def_Shodan/`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/def_Shodan/):
+Located in [`def_Shodan/`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/def_Shodan/):
 - Uses Playwright Chromium automation to interact with Shodan web interfaces.
+- 3-tier login: cached cookies → credential-based login → manual login fallback.
 - Stores authenticated sessions in `shodan_cookies.json` to eliminate repeated logins.
 - Detects database `last_seen` timestamps and performs lightweight diff checks to avoid redundant scraping.
 
-### Dual-Source CVE Mapping (NVD + ChatGPT)
-Located in [`Backend/cve_maper/`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/cve_maper/):
-- **NIST NVD API**: Queries official CVSS metrics (v2/v3.1/v4), CWE taxonomies, severity vectors, and CPE configurations.
-- **ChatGPT Browser Automation**:
-  - Automates free web ChatGPT accounts using Playwright persistent browser contexts.
-  - Features an **Account Rotator** (`add_chatgpt_account.py`) that stores multiple profiles in `Backend/cve_maper/.accounts/`.
-  - Automatically switches accounts when rate limits or hourly message caps are encountered.
-  - Extracts structured JSON containing:
-    - Root-cause vulnerability walkthrough.
-    - MITRE ATT&CK Tactics (TA0001–TA0043) and Techniques (T1190, T1059, etc.) with technical justification.
-    - Detection strategies and actionable mitigation guidelines.
+### 8-Source OSINT CVE Enrichment
+Located in [`cve_maper/`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/cve_maper/):
+
+For each CVE, all 8 sources are fetched **in parallel** using `ThreadPoolExecutor(max_workers=8)` with per-source rate limiters:
+
+| # | Source | Data Provided | Rate Limiting |
+|---|--------|---------------|---------------|
+| 1 | **NVD** | CVSS scores (v2/v3.0/v3.1), CWE, CPE, severity, description | Rolling window (50 req/30s with key) |
+| 2 | **CVE.org** | CNA record, additional references, timeline | 8 req/10s |
+| 3 | **FIRST EPSS** | Exploit probability score (0–1), percentile | 20 req/10s |
+| 4 | **CISA KEV** | Known exploited status, remediation deadline, ransomware | Cached catalog (24h TTL) |
+| 5 | **OSV.dev** | Affected open-source packages, fix versions | 15 req/10s |
+| 6 | **Exploit-DB** | Public exploit/PoC links, EDB IDs | 3 req/10s |
+| 7 | **CWE Catalog** | Weakness details, mitigations, detection methods | Cached catalog (24h TTL) |
+| 8 | **MITRE ATT&CK** | CWE→technique→tactic mappings via STIX | Cached STIX (24h TTL) |
 
 ---
 
@@ -228,8 +233,8 @@ The frontend is located in [`Frontend/Chatbot/`](file:///c:/Users/jassi/OneDrive
   - **Geographic**: `country`, `city`, `state`, `region`
   - **Software & Device**: `product`, `version`, `os`, `cpe`, `tag`, `hash`
   - **Vulnerability & Security**: `vuln`, `has_vuln`, `has_ssl`, `has_screenshot`
-  - **HTTP & Web-Server**: `http.component`, `http.component_category`, `http.title`, `http.status`, `http.waf`
-  - **SSL/TLS & Certificate**: `ssl`, `ssl.version`, `ssl.cert.subject.cn`, `ssl.cert.issuer.cn`, `ssl.ja3s`
+  - **HTTP & Web-Server**: `http.component`, `http.component_category`, `http.favicon.hash`, `http.html_hash`, `http.robots_hash`, `http.securitytxt`, `http.status`, `http.title`, `http.waf`, `title`
+  - **SSL/TLS & Certificate**: `ssl`, `ssl.alpn`, `ssl.cert.fingerprint`, `ssl.cert.issuer.cn`, `ssl.cert.serial`, `ssl.cert.subject.cn`, `ssl.ja3s`, `ssl.jarm`, `ssl.version`
   - **SSH**: `ssh.fingerprint`
 - **Dynamic Facets Sidebar**: Real-time aggregations for Top Countries, Top Open Ports, and Top Organizations.
 - **Interactive Preset Chips**: Quick one-click filters for common searches (`port:22`, `port:80`, `port:443`, `has_vuln:true`, `has_ssl:true`, `product:openssh`).
@@ -271,7 +276,7 @@ The frontend is located in [`Frontend/Chatbot/`](file:///c:/Users/jassi/OneDrive
 
 ## API Reference
 
-The FastAPI backend runs at `http://localhost:8000` ([`Backend/api_server.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/api_server.py)). Interactive OpenAPI documentation is available at `http://localhost:8000/docs`.
+The FastAPI backend runs at `http://localhost:8000` ([`api_server.py`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/Backend/api_server.py)). Interactive OpenAPI documentation is available at `http://localhost:8000/docs`.
 
 ### Chat & AI Agent Endpoints (7)
 | Method | Endpoint | Description |
@@ -279,10 +284,10 @@ The FastAPI backend runs at `http://localhost:8000` ([`Backend/api_server.py`](f
 | `POST` | `/api/chats/new` | Creates a new chat session thread. |
 | `GET` | `/api/chats` | Lists all chat session histories with preview messages. |
 | `GET` | `/api/chats/{thread_id}` | Retrieves all messages, message indices, and tool states for a conversation. |
-| `DELETE` | `/api/chats/{thread_id}` | Deletes a conversation and clears associated tool calls. |
+| `DELETE` | `/api/chats/{thread_id}` | Deletes a conversation, stops running engines, and clears LangGraph checkpoints. |
 | `POST` | `/api/chats/{thread_id}/message` | Sends user prompt and streams LLM tokens and tool calls via SSE. |
 | `POST` | `/api/chats/{thread_id}/approve` | Submits Human-in-the-Loop authorization decision (`{"action": "accept"|"decline"}`). |
-| `POST` | `/api/chats/{thread_id}/stop` | Cancels an ongoing agent reasoning stream. |
+| `POST` | `/api/chats/{thread_id}/stop` | Cancels an ongoing agent reasoning stream and any running engines. |
 
 ### Engine Lifecycle & Streaming Endpoints (4)
 | Method | Endpoint | Description |
@@ -290,20 +295,20 @@ The FastAPI backend runs at `http://localhost:8000` ([`Backend/api_server.py`](f
 | `GET` | `/api/engine/{engine_thread_id}/stream` | Server-Sent Events (SSE) stream for real-time progress events of a running engine. |
 | `POST` | `/api/engine/{engine_thread_id}/stop` | Pauses/stops a running background engine cooperatively. |
 | `POST` | `/api/engine/{engine_thread_id}/resume` | Resumes a paused engine from its latest phase checkpoint. |
-| `GET` | `/api/chats/{thread_id}/engines` | Lists running and paused scanning engines associated with a chat. |
+| `GET` | `/api/chats/{thread_id}/engines` | Lists running and paused scanning engines associated with a chat, plus pending HITL approvals. |
 
 ### Threat Search & OSINT Intelligence Endpoints (4)
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/search/filters` | Returns all 43 supported Shodan search filters grouped by category. |
-| `GET` | `/api/search` | Queries local database using Shodan filter syntax (`?q=...&page=1&page_size=20`). |
+| `GET` | `/api/search` | Queries local database using Shodan filter syntax (`?q=...&page=1`) with faceted results. |
 | `GET` | `/api/search/ip/{ip_address}` | Retrieves full host intelligence (Shodan passive, Nmap active, ACK firewall, SSL, CVEs). |
-| `GET` | `/api/search/cve/{cve_id}` | Retrieves full NVD metrics, CPEs, ChatGPT ATT&CK analysis, and **affected local assets**. |
+| `GET` | `/api/search/cve/{cve_id}` | Retrieves full NVD metrics, CPEs, OSINT enrichment (EPSS, KEV, ATT&CK), and **affected local assets**. |
 
 ### System & Health Endpoints (2)
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/stats` | Returns database statistics (total hosts, scans, ports, CVEs). |
+| `GET` | `/api/stats` | Returns database statistics (total hosts, scans, CVEs, CVE analyses). |
 | `GET` | `/api/health` | Health check endpoint returning system status and database connectivity. |
 
 ---
@@ -320,9 +325,9 @@ Data is stored in PostgreSQL (`cti_db`). Tables are initialized automatically on
 5. **`technologies`**: Detected web technologies and libraries (`scan_id` FK, `category`, `name`, `version`). Indexes on `scan_id`, `name`.
 6. **`cve_details`**: Normalized NIST NVD intelligence (`cve_id` UNIQUE, `description`, `cwe_id`, `cwe_name`, `cvss_version`, `cvss_vector`, `attack_vector`, `attack_complexity`, `privileges_required`, `user_interaction`, `scope`, `confidentiality_impact`, `integrity_impact`, `availability_impact`, `base_score` FLOAT, `severity`, `exploit_available` BOOLEAN, `epss_score` FLOAT, `epss_percentile` FLOAT, `kev_listed` BOOLEAN, `published_date`, `last_modified_date`, `reference_urls` JSONB, `nvd_raw` JSONB). Indexes on `cve_id`, `severity`, `base_score` DESC.
 7. **`cve_affected_products`**: CPE hardware/software configurations from NVD (`cve_detail_id` FK, `vendor`, `product`, `version`, `affected_platform`). Indexes on `cve_detail_id`, `vendor`, `product`.
-8. **`cve_analysis`**: ChatGPT threat analyses (`cve_detail_id` FK UNIQUE, `title`, `exploitation_info` JSONB, `mitigations` JSONB, `detection_recommendations` JSONB, `vulnerability_walkthrough` JSONB, `chatgpt_references` JSONB, `chatgpt_raw` JSONB, `analyzed_at`). Index on `cve_detail_id`.
-9. **`cve_mitre_mappings`**: MITRE ATT&CK framework mapping from ChatGPT (`cve_analysis_id` FK, `tactic_id`, `tactic_name`, `technique_id`, `technique_name`, `justification`). Indexes on `cve_analysis_id`, `technique_id`.
-10. **`nmap_scan_checkpoints`**: Per-phase state checkpoints for 9-phase Nmap scanner (`ip` INET, `engine_thread_id`, `last_phase` INT, `state_data` JSONB, `updated_at`, UNIQUE on `(ip, engine_thread_id)`). Index on `ip`.
+8. **`cve_analysis`**: OSINT enrichment analyses (`cve_detail_id` FK UNIQUE, `title`, `exploitation_info` JSONB (EPSS, KEV, exploits), `mitigations` JSONB (CWE-based), `detection_recommendations` JSONB, `vulnerability_walkthrough` JSONB, `chatgpt_references` JSONB, `chatgpt_raw` JSONB, `analyzed_at`). Index on `cve_detail_id`.
+9. **`cve_mitre_mappings`**: MITRE ATT&CK framework mappings from STIX data (`cve_analysis_id` FK, `tactic_id`, `tactic_name`, `technique_id`, `technique_name`, `justification`). Indexes on `cve_analysis_id`, `technique_id`.
+10. **`nmap_scan_checkpoints`**: Per-phase state checkpoints for 8-phase Nmap scanner (`ip` INET, `engine_thread_id`, `last_phase` INT, `state_data` JSONB, `updated_at`, UNIQUE on `(ip, engine_thread_id)`). Index on `ip`.
 
 ### Chat & Agent Persistence Tables (3 tables)
 11. **`chat_messages`**: Chat conversation history with token-level streaming persistence (`thread_id`, `role` user/assistant, `content`, `message_index`, `is_complete` BOOLEAN, `created_at`, `updated_at`). Index on `(thread_id, message_index)`.
@@ -340,7 +345,7 @@ Data is stored in PostgreSQL (`cti_db`). Tables are initialized automatically on
 | **Node.js** | ≥ 18.0 | React / Vite frontend runtime |
 | **PostgreSQL** | ≥ 16 | Relational CTI data store & LangGraph checkpointer |
 | **Nmap** | Latest | Network port scanner (must be available in system `PATH`) |
-| **Playwright** | Latest | Browser automation for Shodan and ChatGPT |
+| **Playwright** | Latest | Browser automation for Shodan scraping |
 | **Groq API Key** | — | High-speed LLM inference for ReAct agent & query generation |
 | **NVD API Key** | — | Optional but recommended for NIST NVD API rate limits |
 
@@ -355,7 +360,7 @@ cd CTI_v2
 ```
 
 ### 2. Environment & Python Dependencies
-Using [uv](https://docs.astral.sh/uv/):
+Using [uv](https://docs.astral.sh/uv/) (recommended):
 ```bash
 uv sync
 ```
@@ -382,9 +387,11 @@ playwright install chromium
 ```sql
 CREATE DATABASE cti_db;
 ```
+> [!NOTE]
+> Tables are created automatically on first server startup by `db_manager.py` and `chat_persistence.py`. No manual schema setup is required.
 
 ### 5. Environment Variables (`.env`)
-Create a `.env` file in the project root directory:
+Create a `.env` file in the project root directory (see [`.env.example`](file:///c:/Users/jassi/OneDrive/Documents/CTI_V2/.env.example)):
 ```env
 # ─── Shodan Credentials ──────────────────────────────────────────────────────
 shodan_user=your_shodan_username
@@ -406,18 +413,8 @@ GROQ_API_KEY=your_groq_api_key_here
 NIST_API_KEY=your_nist_api_key_here
 ```
 
-### 6. ChatGPT Accounts Setup
-To enable zero-cost ChatGPT vulnerability analysis, register at least one free ChatGPT account:
-```bash
-cd Backend/cve_maper
-python add_chatgpt_account.py
-```
-Follow the interactive prompt:
-- Enter an account label (e.g., `account1`).
-- Playwright opens a browser window.
-- Manually log in to your ChatGPT account.
-- Press Enter in the terminal to save the persistent session profile to `Backend/cve_maper/.accounts/`.
-- *(Optional)* Add multiple accounts to automatically bypass hourly rate limits.
+> [!NOTE]
+> ChatGPT browser automation has been removed. CVE enrichment now uses 8 free public APIs (NVD, CVE.org, FIRST EPSS, CISA KEV, OSV.dev, Exploit-DB, CWE, MITRE ATT&CK) — no accounts or browser profiles needed.
 
 ---
 
@@ -476,8 +473,8 @@ CTI_V2/
 ├── Backend/                          # Python FastAPI & LangGraph backend
 │   ├── README.md                     # Backend modular documentation
 │   ├── api_server.py                 # FastAPI REST (17 endpoints) and SSE streaming server
-│   ├── main_agent.py                 # LangGraph ReAct agent with HITL approval
-│   ├── engine_manager.py             # Background engine lifecycle manager
+│   ├── main_agent.py                 # LangGraph ReAct agent with HITL approval (6 tools)
+│   ├── engine_manager.py             # Background engine lifecycle manager (singleton)
 │   ├── engine_progress.py            # Real-time progress queues & cancel events
 │   ├── db_manager.py                 # Core CTI PostgreSQL schema (10 tables) & query logic
 │   ├── chat_persistence.py           # Chat history & tool call tracking (3 tables)
@@ -488,20 +485,18 @@ CTI_V2/
 │   ├── Engine_cve_input.py           # CVE Research & Enrichment LangGraph engine
 │   │
 │   ├── def_Shodan/                   # Shodan automation module
-│   │   ├── get_ip.py                 # Shodan query search & IP discovery
+│   │   ├── get_ip.py                 # Shodan query search & IP discovery (3-tier login)
 │   │   ├── get_ip_info.py            # Shodan host page scraper & diff engine
 │   │   └── shodan_cookies.json       # Cached authenticated browser cookies
 │   │
 │   ├── def_nmap/                     # Nmap reconnaissance module
-│   │   └── nmap_scanner.py           # 9-Phase full-spectrum scanner with checkpoints
+│   │   └── nmap_scanner.py           # 8-Phase full-spectrum scanner with checkpoints
 │   │
-│   ├── cve_maper/                    # Dual-source vulnerability enrichment
-│   │   ├── cve_mapper.py             # NVD API v2 client + Playwright ChatGPT engine
-│   │   ├── add_chatgpt_account.py    # Multi-account registration CLI utility
-│   │   └── .accounts/                # Persistent Playwright browser profiles
+│   ├── cve_maper/                    # 8-source OSINT CVE enrichment
+│   │   └── cve_mapper.py             # Parallel multi-source enrichment (NVD, CVE.org, EPSS, KEV, OSV, ExploitDB, CWE, ATT&CK)
 │   │
 │   └── query_gen/                    # AI query generation module
-│       └── query_gen_ai.py           # Groq LLM Shodan dork generator
+│       └── query_gen_ai.py           # Groq LLM Shodan dork generator (openai/gpt-oss-20b)
 │
 └── Frontend/
     └── Chatbot/                      # React 19 + Vite Frontend Application
@@ -520,8 +515,23 @@ CTI_V2/
         │       └── NotFoundPage.jsx  # Cyberpunk-styled 404 error page
         │
         ├── package.json              # Frontend dependencies & scripts
-        └── vite.config.js            # Vite configuration & proxy settings
+        └── vite.config.js            # Vite configuration
 ```
+
+---
+
+## Contributing
+
+Contributions are welcome! To get started:
+
+1. **Fork** this repository and create a feature branch.
+2. Follow the [Installation & Setup](#installation--setup) guide to get the platform running locally.
+3. Make your changes with clear, descriptive commit messages.
+4. Ensure the backend starts cleanly (`python Backend/api_server.py`) and the frontend builds (`cd Frontend/Chatbot && npm run build`).
+5. Submit a **Pull Request** with a description of your changes and the problem they solve.
+
+> [!TIP]
+> For large changes, open an issue first to discuss the proposed architecture before investing significant effort.
 
 ---
 

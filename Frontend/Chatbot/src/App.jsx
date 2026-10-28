@@ -14,19 +14,19 @@ const TOOL_NODE_MAP = {
     { key: 'get_ips', label: 'IP Discovery' },
     { key: 'process_all_ips', label: 'Shodan + Nmap Scanning' },
     { key: 'extract_cves', label: 'CVE Extraction' },
-    { key: 'cve_mapper', label: 'NVD + ChatGPT Enrichment' },
+    { key: 'cve_mapper', label: 'OSINT CVE Enrichment' },
     { key: 'summary', label: 'Summary' },
   ],
   scan_ip_list: [
     { key: 'init_ips', label: 'Initialize IPs' },
     { key: 'process_all_ips', label: 'Shodan + Nmap Scanning' },
     { key: 'extract_cves', label: 'CVE Extraction' },
-    { key: 'cve_mapper', label: 'NVD + ChatGPT Enrichment' },
+    { key: 'cve_mapper', label: 'OSINT CVE Enrichment' },
     { key: 'summary', label: 'Summary' },
   ],
   scan_cve_list: [
     { key: 'init_cves', label: 'Initialize CVEs' },
-    { key: 'cve_mapper', label: 'NVD + ChatGPT Enrichment' },
+    { key: 'cve_mapper', label: 'OSINT CVE Enrichment' },
     { key: 'summary', label: 'Summary' },
   ],
 }

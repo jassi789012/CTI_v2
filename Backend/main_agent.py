@@ -13,7 +13,7 @@ Tools Available:
   Engine Tools:
     - scan_natural_language_query — Runs the full pipeline from a user query
     - scan_ip_list               — Scans a list of known IP addresses
-    - scan_cve_list              — Fetches NVD data + ChatGPT analysis for CVE IDs
+    - scan_cve_list              — Enriches CVE IDs from 8 OSINT sources in parallel
 
 Architecture:
   - LLM:          Groq API  (openai/gpt-oss-120b)
@@ -140,19 +140,19 @@ in a formatted table — you only receive a brief summary (row count and column 
 #### scan_natural_language_query
 Use this when the user describes what they want to find in natural language.
 - Example: "Find Apache servers in India with known vulnerabilities"
-- Full pipeline: query → Shodan dorks → IP discovery → Nmap + Shodan scans → CVE extraction → NVD enrichment → ChatGPT analysis
+- Full pipeline: query → Shodan dorks → IP discovery → Nmap + Shodan scans → CVE extraction → 8-source OSINT enrichment
 - Use ONLY when the user doesn't have specific IPs or CVEs and needs discovery.
 
 #### scan_ip_list
 Use this when the user provides specific IP addresses to scan.
 - Example: "Scan 1.2.3.4 and 5.6.7.8"
-- Runs Nmap (8-phase) + Shodan scraping → CVE extraction → NVD + ChatGPT enrichment
+- Runs Nmap (8-phase) + Shodan scraping → CVE extraction → 8-source OSINT enrichment
 - Note: The scanner automatically skips IPs that were scanned within the last 14 days.
 
 #### scan_cve_list
 Use this when the user provides specific CVE IDs to look up.
 - Example: "Give me details about CVE-2024-1234"
-- Fetches NVD data → ChatGPT MITRE ATT&CK mapping + vulnerability walkthrough
+- Enriches CVEs from NVD, CVE.org, FIRST EPSS, CISA KEV, OSV.dev, Exploit-DB, CWE, MITRE ATT&CK
 
 ## CRITICAL: Database-First Query Routing
 
@@ -204,7 +204,7 @@ def scan_natural_language_query(
     description into Shodan search queries, discovers IPs, then runs 
     parallel Nmap (8-phase full-spectrum) and Shodan scans on every IP found.
     After scanning, it extracts all CVEs from the scan data, fetches NVD 
-    details, and enriches each CVE with ChatGPT MITRE ATT&CK analysis.
+    details, and enriches each CVE from 8 OSINT sources (NVD, CVE.org, EPSS, CISA KEV, OSV.dev, Exploit-DB, CWE, ATT&CK).
     
     Use this when the user describes what they want to find in plain English,
     for example: "Find vulnerable Apache servers in Germany" or 
@@ -295,7 +295,7 @@ def scan_ip_list(
       Phase 8: SCTP Init scan
     
     Additionally, Shodan data is scraped in parallel for each IP.
-    After scanning, CVEs are extracted and enriched via NVD + ChatGPT.
+    After scanning, CVEs are extracted and enriched via 8 OSINT sources.
     
     Expected duration: 5-20 minutes per IP address.
     
@@ -362,21 +362,22 @@ def scan_cve_list(
     tool_call_id: Annotated[str, InjectedToolCallId],
     config: RunnableConfig,
 ) -> str:
-    """Fetch NVD data and run ChatGPT MITRE ATT&CK analysis for a list of CVE IDs.
+    """Enrich a list of CVE IDs from 8 public intelligence sources in parallel.
     
     Use this when the user provides specific CVE identifiers they want researched.
     This skips all IP scanning — it goes directly to CVE data enrichment.
     
-    For each CVE, the tool:
-      1. Fetches full vulnerability data from the NIST NVD REST API
-         (description, CVSS scores, attack vectors, affected products, etc.)
-      2. Sends the CVE to ChatGPT for enrichment:
-         - MITRE ATT&CK technique mapping
-         - Detailed vulnerability walkthrough
-         - Exploitation analysis
+    For each CVE, the tool fetches data from 8 sources simultaneously:
+      1. NVD — CVSS scores, CWE, CPE, severity, description
+      2. CVE.org — CNA record, additional references
+      3. FIRST EPSS — exploit probability score + percentile
+      4. CISA KEV — known exploited status, remediation deadline
+      5. OSV.dev — affected open-source packages + fix versions
+      6. Exploit-DB — public exploit/PoC links
+      7. CWE Catalog — weakness details, mitigations
+      8. MITRE ATT&CK — CWE→technique→tactic mappings
     
-    NVD API rate: ~1,800 CVEs/hour with API key, ~553/hour without.
-    ChatGPT enrichment: ~1-2 minutes per CVE.
+    Speed: ~30-60 seconds per CVE (all 8 sources fetched in parallel).
     
     Args:
         cve_ids: List of CVE identifiers to research.

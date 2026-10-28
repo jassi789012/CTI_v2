@@ -2,7 +2,8 @@
 CTI Engine — CVE Input Pipeline (LangGraph)
 =============================================
 Partial pipeline: Takes a list of CVE IDs directly and runs
-NVD data fetching + ChatGPT enrichment.
+multi-source OSINT enrichment (NVD, CVE.org, EPSS, CISA KEV,
+OSV.dev, Exploit-DB, CWE, MITRE ATT&CK) in parallel.
 
 Skips query generation, IP discovery, Shodan/Nmap scanning, and
 CVE extraction — use this when you already have CVE numbers.
@@ -152,10 +153,8 @@ def run_engine(
             "ip_data_fetcher_nmap_done": "0/0",
             "cve_extractor": "skipped",
             "cve_extractor_done": "0/0",
-            "cve_mapper_nvd": "running",
-            "cve_mapper_nvd_done": "0/0",
-            "cve_mapper_gpt": "waiting for nvd",
-            "cve_mapper_gpt_done": "0/0",
+            "cve_enrichment": "running",
+            "cve_enrichment_done": "0/0",
         }
 
         return graph.invoke(initial_state, config)

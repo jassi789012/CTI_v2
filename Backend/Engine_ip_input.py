@@ -158,10 +158,8 @@ def run_engine(
             "ip_data_fetcher_nmap_done": "0/0",
             "cve_extractor": "waiting for ips",
             "cve_extractor_done": "0/0",
-            "cve_mapper_nvd": "waiting for cves",
-            "cve_mapper_nvd_done": "0/0",
-            "cve_mapper_gpt": "waiting for cves",
-            "cve_mapper_gpt_done": "0/0",
+            "cve_enrichment": "waiting for cves",
+            "cve_enrichment_done": "0/0",
         }
 
         return graph.invoke(initial_state, config)

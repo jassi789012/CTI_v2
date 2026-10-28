@@ -167,13 +167,13 @@ export default function CveDetailPage() {
       })
     : products
 
-  // Combined references (NVD + ChatGPT)
+  // Combined references (NVD + OSINT sources)
   const nvdRefs = data.reference_urls || []
-  const chatgptRefs = analysis?.chatgpt_references || []
+  const osintRefs = analysis?.chatgpt_references || []
   const allReferences = [...nvdRefs]
-  chatgptRefs.forEach(cr => {
+  osintRefs.forEach(cr => {
     if (cr && cr.url && !allReferences.some(r => (typeof r === 'string' ? r : r.url) === cr.url)) {
-      allReferences.push({ url: cr.url, tags: [cr.source || 'AI Sourced Reference'] })
+      allReferences.push({ url: cr.url, tags: [cr.source || 'OSINT Source'] })
     }
   })
 

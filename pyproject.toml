@@ -1,7 +1,7 @@
 [project]
 name = "cti-v2"
 version = "0.1.0"
-description = "Add your description here"
+description = "Autonomous AI-powered Cyber Threat Intelligence platform with LangGraph ReAct agent, 8-phase Nmap scanning, Shodan automation, and 8-source OSINT CVE enrichment"
 readme = "README.md"
 authors = [
     { name = "jassi789012", email = "jassi789012singh@gmail.com" }
@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "bs4>=0.0.2",
+    "fastapi>=0.100.0",
     "langchain-community>=0.4.2",
     "langchain-core>=1.6.5",
     "langchain-groq>=1.1.3",
@@ -20,7 +21,10 @@ dependencies = [
     "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
     "python-nmap>=0.7.1",
+    "requests>=2.31.0",
     "sqlalchemy>=2.1.5",
+    "sse-starlette>=1.6.0",
+    "uvicorn>=0.27.0",
 ]
 
 [project.scripts]

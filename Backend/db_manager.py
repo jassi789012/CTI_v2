@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS technologies (
 CREATE INDEX IF NOT EXISTS idx_tech_scan_id ON technologies (scan_id);
 CREATE INDEX IF NOT EXISTS idx_tech_name    ON technologies (name);
 
--- 6. CVE Details — enriched CVE data from NVD
+-- 6. CVE Details — enriched CVE data from NVD + OSINT sources
 CREATE TABLE IF NOT EXISTS cve_details (
     id                     SERIAL PRIMARY KEY,
     cve_id                 TEXT NOT NULL UNIQUE,
@@ -145,6 +145,10 @@ CREATE TABLE IF NOT EXISTS cve_details (
     availability_impact    TEXT,
     base_score             FLOAT,
     severity               TEXT,
+    epss_score             FLOAT,
+    epss_percentile        FLOAT,
+    kev_listed             BOOLEAN DEFAULT FALSE,
+    exploit_available      BOOLEAN DEFAULT FALSE,
     published_date         TEXT,
     last_modified_date     TEXT,
     reference_urls         JSONB DEFAULT '[]'::jsonb,
@@ -170,7 +174,7 @@ CREATE INDEX IF NOT EXISTS idx_cve_ap_detail_id ON cve_affected_products (cve_de
 CREATE INDEX IF NOT EXISTS idx_cve_ap_vendor    ON cve_affected_products (vendor);
 CREATE INDEX IF NOT EXISTS idx_cve_ap_product   ON cve_affected_products (product);
 
--- 8. CVE Analysis — ChatGPT enrichment
+-- 8. CVE Analysis — OSINT enrichment (EPSS, KEV, CWE, exploits, ATT&CK)
 CREATE TABLE IF NOT EXISTS cve_analysis (
     id                        SERIAL PRIMARY KEY,
     cve_detail_id             INT NOT NULL UNIQUE REFERENCES cve_details(id) ON DELETE CASCADE,
@@ -186,7 +190,7 @@ CREATE TABLE IF NOT EXISTS cve_analysis (
 
 CREATE INDEX IF NOT EXISTS idx_cve_analysis_detail_id ON cve_analysis (cve_detail_id);
 
--- 9. CVE MITRE ATT&CK Mappings — from ChatGPT
+-- 9. CVE MITRE ATT&CK Mappings — from STIX data
 CREATE TABLE IF NOT EXISTS cve_mitre_mappings (
     id               SERIAL PRIMARY KEY,
     cve_analysis_id  INT NOT NULL REFERENCES cve_analysis(id) ON DELETE CASCADE,
@@ -255,6 +259,21 @@ class DBManager:
         try:
             with self.conn.cursor() as cur:
                 cur.execute(SCHEMA_SQL)
+                # Migration: add new columns to existing cve_details tables
+                for col, defn in [
+                    ("epss_score", "FLOAT"),
+                    ("epss_percentile", "FLOAT"),
+                    ("kev_listed", "BOOLEAN DEFAULT FALSE"),
+                    ("exploit_available", "BOOLEAN DEFAULT FALSE"),
+                ]:
+                    cur.execute(f"""
+                        DO $$
+                        BEGIN
+                            ALTER TABLE cve_details ADD COLUMN {col} {defn};
+                        EXCEPTION WHEN duplicate_column THEN
+                            NULL;
+                        END $$;
+                    """)
             self.conn.commit()
             print("[+] Database tables initialized successfully.")
         except Exception as e:
@@ -794,7 +813,7 @@ class DBManager:
             return cur.fetchone() is not None
 
     def check_cve_analysis_exists(self, cve_id: str) -> bool:
-        """Check if a CVE already has ChatGPT analysis stored."""
+        """Check if a CVE already has OSINT enrichment analysis stored."""
         with self.conn.cursor() as cur:
             cur.execute("""
                 SELECT ca.id FROM cve_analysis ca
@@ -825,11 +844,14 @@ class DBManager:
                         attack_complexity, privileges_required,
                         user_interaction, scope, confidentiality_impact,
                         integrity_impact, availability_impact,
-                        base_score, severity, published_date,
+                        base_score, severity, epss_score, epss_percentile,
+                        kev_listed, exploit_available,
+                        published_date,
                         last_modified_date, reference_urls, nvd_raw
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s
                     )
                     ON CONFLICT (cve_id) DO UPDATE SET
                         description            = EXCLUDED.description,
@@ -847,6 +869,10 @@ class DBManager:
                         availability_impact    = EXCLUDED.availability_impact,
                         base_score             = EXCLUDED.base_score,
                         severity               = EXCLUDED.severity,
+                        epss_score             = COALESCE(EXCLUDED.epss_score, cve_details.epss_score),
+                        epss_percentile        = COALESCE(EXCLUDED.epss_percentile, cve_details.epss_percentile),
+                        kev_listed             = COALESCE(EXCLUDED.kev_listed, cve_details.kev_listed),
+                        exploit_available      = COALESCE(EXCLUDED.exploit_available, cve_details.exploit_available),
                         published_date         = EXCLUDED.published_date,
                         last_modified_date     = EXCLUDED.last_modified_date,
                         reference_urls         = EXCLUDED.reference_urls,
@@ -870,6 +896,10 @@ class DBManager:
                     nvd_parsed.get("availability_impact"),
                     nvd_parsed.get("base_score"),
                     nvd_parsed.get("severity"),
+                    nvd_parsed.get("epss_score"),
+                    nvd_parsed.get("epss_percentile"),
+                    nvd_parsed.get("kev_listed", False),
+                    nvd_parsed.get("exploit_available", False),
                     nvd_parsed.get("published_date"),
                     nvd_parsed.get("last_modified_date"),
                     Json(nvd_parsed.get("reference_urls", [])),
@@ -907,9 +937,9 @@ class DBManager:
 
     def save_cve_analysis(self, cve_id: str, chatgpt_parsed: dict) -> int:
         """
-        Save ChatGPT analysis for a CVE. Returns the cve_analysis_id.
+        Save OSINT enrichment analysis for a CVE. Returns the cve_analysis_id.
 
-        chatgpt_parsed is the parsed JSON from ChatGPT containing:
+        chatgpt_parsed is the merged OSINT dict containing:
             title, exploitation, mitigations, detection_recommendations,
             vulnerability_walkthrough, mitre_attack_mapping, references
         """
@@ -979,7 +1009,7 @@ class DBManager:
 
             self.conn.commit()
             mitre_count = len(chatgpt_parsed.get("mitre_attack_mapping", []))
-            print(f"[+] CVE {cve_id}: ChatGPT analysis saved "
+            print(f"[+] CVE {cve_id}: OSINT analysis saved "
                   f"(id={analysis_id}, {mitre_count} MITRE mappings).")
             return analysis_id
 
@@ -1007,7 +1037,7 @@ class DBManager:
             return detail
 
     def get_cve_full(self, cve_id: str) -> dict:
-        """Get CVE details + ChatGPT analysis + MITRE mappings."""
+        """Get CVE details + OSINT enrichment analysis + MITRE mappings."""
         detail = self.get_cve_detail(cve_id)
         if not detail:
             return None
